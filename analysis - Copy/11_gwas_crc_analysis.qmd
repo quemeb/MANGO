@@ -1,0 +1,760 @@
+---
+title: "GWAS CRC Real-Data Analysis"
+format: html
+editor: visual
+---
+
+Real-data analysis of CRC GWAS genes on the integrated network. This is what the synthetic simulations are benchmarking against.
+
+```{r}
+suppressPackageStartupMessages({
+  library(igraph)
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(RColorBrewer)
+  library(scales)
+  library(ggraph)
+  library(here)
+})
+
+source(here::here("R/stats.R"))
+source(here::here("R/sampling.R"))
+source(here::here("R/simulation.R"))
+source(here::here("R/plotting.R"))
+```
+
+```{r}
+largest_subgraph_undirected <- readRDS(here::here("networks", "largest_subgraph_undirected.rds"))
+bin_cache                   <- readRDS(here::here("networks", "degree_bin_cache.rds"))
+gwas_genes_crc              <- readRDS(here::here("data", "gwas_genes_crc.rds"))
+```
+
+```{r}
+# Filter to genes actually on the network
+gwas_on_net <- intersect(gwas_genes_crc, V(largest_subgraph_undirected)$name)
+cat("GWAS genes total:", length(gwas_genes_crc), "\n")
+cat("GWAS genes on network:", length(gwas_on_net), "\n")
+```
+
+# Degree diagnostic
+
+```{r}
+plot_degree_diagnostic(largest_subgraph_undirected, gwas_on_net,
+                       title = "CRC GWAS genes vs network background")
+```
+
+```{r}
+deg_all <- degree(largest_subgraph_undirected)
+node_names <- V(largest_subgraph_undirected)$name
+
+df_deg <- data.frame(
+  gene   = node_names,
+  degree = deg_all,
+  group  = ifelse(node_names %in% gwas_on_net, "GWAS genes", "Background")
+)
+
+ggplot(df_deg, aes(x = degree, fill = group)) +
+  geom_density(alpha = 0.4) +
+  coord_cartesian(xlim = c(0, quantile(deg_all, 0.95))) +
+  labs(
+    title = "Degree distribution (linear scale)",
+    x     = "Degree",
+    y     = "Density",
+    fill  = ""
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+deg_gwas <- degree(largest_subgraph_undirected, v = gwas_on_net)
+
+cat("Network mean degree:", round(mean(deg_all), 2), "\n")
+cat("GWAS mean degree:", round(mean(deg_gwas), 2), "\n")
+cat("GWAS median degree:", median(deg_gwas), "\n")
+cat("KS test p-value:", format.pval(ks.test(deg_gwas, deg_all)$p.value), "\n")
+```
+
+# GWAS subnetwork visualization
+
+```{r}
+#| label: gwas-subnetwork-simple
+#| fig-width: 10
+#| fig-height: 10
+
+gwas_subgraph <- induced_subgraph(largest_subgraph_undirected, vids = gwas_on_net)
+comp <- components(gwas_subgraph)
+
+set.seed(42)
+ggraph(gwas_subgraph, layout = "fr") +
+  geom_edge_link(alpha = 0.4) +
+  geom_node_point(color = "darkblue", size = 4) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 2.5, max.overlaps = 20) +
+  theme_void() +
+  ggtitle(paste0("CRC GWAS subnetwork (", length(gwas_on_net), " genes, ",
+                  comp$no, " components)"))
+```
+
+```{r}
+#| label: gwas-subnetwork-annotated
+#| fig-width: 10
+#| fig-height: 10
+
+# Build node metadata
+node_df <- data.frame(
+  name = V(gwas_subgraph)$name,
+  comp_id = comp$membership,
+  comp_size = comp$csize[comp$membership]
+)
+
+# Assign colors: largest component = red, other multi-gene = Set2 palette, singletons = grey
+largest_comp_id <- which.max(comp$csize)
+node_df$color <- "grey70"
+node_df$color[node_df$comp_id == largest_comp_id] <- "#E63946"
+
+multi_comp_ids <- setdiff(
+  unique(node_df$comp_id[node_df$comp_size > 1]),
+  largest_comp_id
+)
+if (length(multi_comp_ids) > 0) {
+  palette <- RColorBrewer::brewer.pal(max(length(multi_comp_ids), 3), "Set2")
+  for (i in seq_along(multi_comp_ids)) {
+    node_df$color[node_df$comp_id == multi_comp_ids[i]] <- palette[i]
+  }
+}
+
+V(gwas_subgraph)$color <- node_df$color
+
+set.seed(42)
+ggraph(gwas_subgraph, layout = "fr") +
+  geom_edge_link(alpha = 0.4) +
+  geom_node_point(aes(color = color), size = 4, show.legend = FALSE) +
+  scale_color_identity() +
+  geom_node_text(aes(label = name), repel = TRUE, size = 2.5, max.overlaps = 20) +
+  theme_void() +
+  ggtitle(paste0("CRC GWAS subnetwork — colored by component (",
+                  comp$no, " components, largest = ", max(comp$csize), " genes)"))
+```
+
+# Permutation tests: all methods, bins 1-10
+
+Wrap the GWAS gene list into a pathway_data structure so we can use the existing simulation function.
+
+```{r}
+gwas_pathway_data <- data.frame(
+  PATHWAY_NAMES = "CRC_GWAS",
+  stringsAsFactors = FALSE
+)
+gwas_pathway_data$Genes <- list(gwas_on_net)
+```
+
+```{r}
+res_bins <- run_pathway_noise_sweep_compare_ics_bins(
+  pathway_name   = "CRC_GWAS",
+  n_total        = length(gwas_on_net),
+  noise_steps    = 0,
+  n_iterations   = 1000,
+  ics_bins_set   = 1:10,
+  graph          = largest_subgraph_undirected,
+  pathway_data   = gwas_pathway_data,
+  bin_cache      = bin_cache,
+  seed           = 42,
+  replace_null   = TRUE,
+  run_uniform_null = TRUE
+)
+```
+
+## Degree-matched null p-values by bin scheme
+
+```{r}
+res_dm <- res_bins %>%
+  filter(!grepl("sensitivity", null_type))
+
+res_dm %>%
+  select(method, null_type, ics_bins, observed, null_mean, null_sd, p_value) %>%
+  arrange(method, ics_bins)
+```
+
+## Uniform null p-values (sensitivity)
+
+```{r}
+res_uniform <- res_bins %>%
+  filter(grepl("sensitivity", null_type))
+
+if (nrow(res_uniform) > 0) {
+  res_uniform %>%
+    select(method, null_type, observed, null_mean, null_sd, p_value)
+}
+```
+
+## Bin-stability curve: all methods
+
+How p-values change as the number of degree-matching bins varies from 1 to 10.
+
+```{r}
+# Extract stat type from method name for grouping
+stability_df <- res_dm %>%
+  mutate(
+    stat = case_when(
+      grepl("^ICS",         method) ~ "ICS",
+      grepl("^Global Moran", method) ~ "Global Moran's I",
+      grepl("^Local Moran",  method) ~ "Local Moran's I",
+      grepl("^Getis",       method) ~ "Gi*",
+      grepl("^Join",        method) ~ "Join count",
+      TRUE ~ method
+    )
+  )
+
+ggplot(stability_df, aes(x = ics_bins, y = p_value, color = stat, group = stat)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "grey40") +
+  scale_x_continuous(breaks = 1:10) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(
+    title = "Bin-stability curve: CRC GWAS genes",
+    subtitle = "p-value vs number of degree-matching bins (1 = uniform, 2+ = degree-matched)",
+    x     = "Number of degree bins",
+    y     = "One-sided p-value",
+    color = "Method"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+# Same plot on -log10 scale for clearer separation at small p-values
+ggplot(stability_df, aes(x = ics_bins, y = -log10(pmax(p_value, 1e-4)),
+                         color = stat, group = stat)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+  scale_x_continuous(breaks = 1:10) +
+  labs(
+    title = "Bin-stability curve: CRC GWAS genes (-log10 scale)",
+    x     = "Number of degree bins",
+    y     = "-log10(p-value)",
+    color = "Method"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## Effect size stability
+
+```{r}
+ggplot(stability_df, aes(x = ics_bins, y = effect_directional,
+                         color = stat, group = stat)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  geom_hline(yintercept = 0, linewidth = 0.5) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(
+    title = "Effect size stability: CRC GWAS genes",
+    x     = "Number of degree bins",
+    y     = "Directional effect (observed - null mean)",
+    color = "Method"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+# Structural decomposition: GWAS subgraph
+
+Analyse the GWAS-induced subgraph structure directly — connected components, articulation points, and bridge genes — without ICS-based LOO.
+
+```{r}
+#| label: gwas-subgraph
+gwas_subg <- induced_subgraph(largest_subgraph_undirected, vids = gwas_on_net)
+comp <- components(gwas_subg)
+
+cat("GWAS genes on network:", length(gwas_on_net), "\n")
+cat("Connected components:", comp$no, "\n")
+cat("Largest component size:", max(comp$csize), "\n")
+cat("Isolated genes (degree 0 in subgraph):", sum(degree(gwas_subg) == 0), "\n")
+cat("Edge density:", round(edge_density(gwas_subg), 5), "\n")
+cat("ICS (normalised):", round(ics_norm(gwas_subg), 5), "\n")
+```
+
+## Component size distribution
+
+```{r}
+#| label: comp-sizes
+comp_df <- tibble(
+  comp_id   = seq_along(comp$csize),
+  comp_size = comp$csize
+) %>%
+  arrange(desc(comp_size))
+
+comp_df %>%
+  count(comp_size, name = "n_components") %>%
+  arrange(desc(comp_size)) %>%
+  knitr::kable(caption = "GWAS subgraph: component size distribution")
+```
+
+```{r}
+#| label: plot-comp-sizes
+#| fig-width: 10
+#| fig-height: 5
+comp_df_top <- comp_df %>%
+  filter(comp_size > 1) %>%
+  mutate(comp_label = paste0("C", comp_id, " (n=", comp_size, ")"))
+
+ggplot(comp_df_top, aes(x = reorder(comp_label, -comp_size), y = comp_size)) +
+  geom_col(fill = "steelblue", width = 0.7) +
+  labs(
+    title = "GWAS subgraph: connected components (size > 1)",
+    x     = "Component",
+    y     = "Number of genes"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Articulation points
+
+Articulation (cut) points are genes whose removal increases the number of connected components in the GWAS subgraph — they are structural bridges holding clusters together.
+
+```{r}
+#| label: articulation-points
+art_points <- articulation_points(gwas_subg)
+art_names <- V(gwas_subg)$name[art_points]
+
+cat("Articulation points:", length(art_names), "/", length(gwas_on_net),
+    "(", round(100 * length(art_names) / length(gwas_on_net), 1), "%)\n")
+
+# For each articulation point: subgraph degree and component membership
+art_df <- tibble(
+  gene            = V(gwas_subg)$name,
+  subgraph_degree = degree(gwas_subg),
+  full_degree     = degree(largest_subgraph_undirected, v = V(gwas_subg)$name),
+  comp_id         = comp$membership,
+  comp_size       = comp$csize[comp$membership],
+  is_articulation = gene %in% art_names
+)
+
+art_df %>%
+  filter(is_articulation) %>%
+  arrange(desc(subgraph_degree)) %>%
+  select(gene, subgraph_degree, full_degree, comp_size) %>%
+  knitr::kable(caption = "Articulation points in GWAS subgraph (bridge genes)")
+```
+
+```{r}
+#| label: plot-art-vs-degree
+#| fig-width: 10
+#| fig-height: 6
+ggplot(art_df, aes(x = subgraph_degree, y = full_degree, color = is_articulation)) +
+  geom_point(alpha = 0.6, size = 2.5) +
+  scale_color_manual(values = c("FALSE" = "steelblue", "TRUE" = "firebrick")) +
+  labs(
+    title = "GWAS genes: subgraph degree vs full network degree",
+    x     = "Degree within GWAS subgraph",
+    y     = "Degree in full network",
+    color = "Articulation point"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## What happens when articulation points are removed?
+
+For each articulation point, compute how many new components are created by its removal.
+
+```{r}
+#| label: art-point-impact
+art_impact <- bind_rows(lapply(art_names, function(g) {
+  subg_minus <- induced_subgraph(gwas_subg, vids = setdiff(V(gwas_subg)$name, g))
+  new_comps <- components(subg_minus)$no
+  tibble(
+    gene              = g,
+    subgraph_degree   = degree(gwas_subg, v = g),
+    comps_without     = new_comps,
+    delta_components  = new_comps - comp$no
+  )
+})) %>%
+  arrange(desc(delta_components), desc(subgraph_degree))
+
+art_impact %>%
+  knitr::kable(caption = "Articulation point impact: new components created by removal")
+```
+
+```{r}
+#| label: plot-art-impact
+#| fig-width: 10
+#| fig-height: 5
+ggplot(art_impact, aes(x = reorder(gene, -delta_components), y = delta_components)) +
+  geom_col(fill = "firebrick", width = 0.7) +
+  labs(
+    title = "Articulation point impact: additional components on removal",
+    x     = "Gene",
+    y     = "Additional components created"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Top connected genes in GWAS subgraph
+
+```{r}
+#| label: top-connected
+art_df %>%
+  arrange(desc(subgraph_degree)) %>%
+  select(gene, subgraph_degree, full_degree, is_articulation, comp_size) %>%
+  head(20) %>%
+  knitr::kable(caption = "Top 20 GWAS genes by subgraph degree")
+```
+
+## Component-Level Leave-One-Out
+
+For each connected component in the GWAS-induced subgraph, remove its member genes from the GWAS gene set and rerun Global Moran's I with bins = 10 degree-stratified permutation null (same parameters as the main test). `delta_p = p_value(without component) - p_value(full set)` quantifies each component's contribution to the global signal.
+
+```{r}
+#| label: component-loo
+#| cache: true
+
+library(foreach)
+library(doParallel)
+
+n_perm_loo <- 1000
+n_cores    <- 7
+
+prep_loo  <- prep_graph_fast(largest_subgraph_undirected)
+g_loo     <- prep_loo$g
+A_loo     <- prep_loo$A
+nodes_loo <- prep_loo$nodes
+
+# Baseline: full-set Global Moran's I p-value (bins = 10)
+idx_full <- match(gwas_on_net, nodes_loo)
+x_full   <- integer(length(nodes_loo)); x_full[idx_full] <- 1L
+obs_gm_full <- global_moran_I(A_loo, x_full)
+
+set.seed(42)
+rand_full <- numeric(n_perm_loo)
+for (i in seq_len(n_perm_loo)) {
+  s     <- sample_degree_matched(gwas_on_net, bin_cache, num_bins = 10, replace = TRUE)
+  idx_s <- match(s, nodes_loo)
+  x_s   <- integer(length(nodes_loo)); x_s[idx_s] <- 1L
+  rand_full[i] <- global_moran_I(A_loo, x_s)
+}
+p_value_full <- mean(rand_full >= obs_gm_full)
+
+# Component LOO in parallel
+membership_vec <- comp$membership
+names(membership_vec) <- V(gwas_subg)$name
+unique_comp_ids <- sort(unique(membership_vec))
+
+cl_comp <- parallel::makeCluster(n_cores)
+doParallel::registerDoParallel(cl_comp)
+parallel::clusterEvalQ(cl_comp, {
+  suppressPackageStartupMessages({ library(igraph); library(Matrix) })
+  NULL
+})
+parallel::clusterExport(
+  cl_comp,
+  varlist = c("A_loo", "nodes_loo", "bin_cache", "n_perm_loo",
+              "gwas_on_net", "membership_vec",
+              "global_moran_I", "sample_degree_matched"),
+  envir = environment()
+)
+
+component_loo_raw <- foreach(cid = unique_comp_ids, .combine = bind_rows) %dopar% {
+  comp_genes <- names(membership_vec)[membership_vec == cid]
+  reduced    <- setdiff(gwas_on_net, comp_genes)
+
+  if (length(reduced) < 3) {
+    return(data.frame(
+      comp_id         = cid,
+      comp_size       = length(comp_genes),
+      comp_genes_raw  = I(list(comp_genes)),
+      p_value_without = NA_real_,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  idx_obs <- match(reduced, nodes_loo)
+  x_obs   <- integer(length(nodes_loo)); x_obs[idx_obs] <- 1L
+  obs_gm  <- global_moran_I(A_loo, x_obs)
+
+  set.seed(42L + as.integer(cid))
+  rand_gm <- numeric(n_perm_loo)
+  for (i in seq_len(n_perm_loo)) {
+    s     <- sample_degree_matched(reduced, bin_cache, num_bins = 10, replace = TRUE)
+    idx_s <- match(s, nodes_loo)
+    x_s   <- integer(length(nodes_loo)); x_s[idx_s] <- 1L
+    rand_gm[i] <- global_moran_I(A_loo, x_s)
+  }
+
+  data.frame(
+    comp_id         = cid,
+    comp_size       = length(comp_genes),
+    comp_genes_raw  = I(list(comp_genes)),
+    p_value_without = mean(rand_gm >= obs_gm),
+    stringsAsFactors = FALSE
+  )
+}
+
+parallel::stopCluster(cl_comp)
+
+trunc_genes <- function(gs) {
+  if (length(gs) <= 10) paste(gs, collapse = ", ")
+  else paste0(paste(gs[1:10], collapse = ", "), ", ...")
+}
+
+component_loo_tbl <- component_loo_raw %>%
+  mutate(
+    comp_genes          = vapply(comp_genes_raw, trunc_genes, character(1)),
+    p_value_full        = p_value_full,
+    delta_p             = p_value_without - p_value_full,
+    significant_without = p_value_without < 0.05
+  ) %>%
+  select(comp_id, comp_size, comp_genes, p_value_without,
+         p_value_full, delta_p, significant_without) %>%
+  arrange(desc(delta_p))
+
+component_loo_tbl %>%
+  knitr::kable(digits = 4,
+               caption = "Component LOO: p-value change when each component is removed")
+```
+
+```{r}
+#| label: plot-component-loo
+#| fig-width: 12
+#| fig-height: 6
+comp_plot_df <- component_loo_tbl %>%
+  mutate(comp_label = paste0("C", comp_id, " (n=", comp_size, ")"),
+         comp_label = factor(comp_label, levels = comp_label[order(-delta_p)]))
+
+ggplot(comp_plot_df, aes(x = comp_label, y = delta_p, fill = comp_size)) +
+  geom_col(width = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_fill_viridis_c(option = "D") +
+  labs(
+    title = "Component LOO: contribution to Global Moran's I signal",
+    subtitle = paste0("delta_p = p(without component) - p(full set); baseline p = ",
+                      signif(p_value_full, 3)),
+    x    = "Component",
+    y    = expression(Delta * "p = p(without) - p(full)"),
+    fill = "Component\nsize"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Gene-Level Leave-One-Out (Jackknife)
+
+For each GWAS gene on the network, remove that single gene and rerun Global Moran's I (bins = 10, same permutations). This jackknife gives per-gene contribution to the global signal, including singletons as a sanity check.
+
+```{r}
+#| label: gene-loo
+#| cache: true
+
+library(foreach)
+library(doParallel)
+
+cl_gene <- parallel::makeCluster(n_cores)
+doParallel::registerDoParallel(cl_gene)
+parallel::clusterEvalQ(cl_gene, {
+  suppressPackageStartupMessages({ library(igraph); library(Matrix) })
+  NULL
+})
+parallel::clusterExport(
+  cl_gene,
+  varlist = c("A_loo", "nodes_loo", "bin_cache", "n_perm_loo",
+              "gwas_on_net",
+              "global_moran_I", "sample_degree_matched"),
+  envir = environment()
+)
+
+gene_loo_raw <- foreach(gg = gwas_on_net, .combine = bind_rows) %dopar% {
+  reduced <- setdiff(gwas_on_net, gg)
+
+  if (length(reduced) < 3) {
+    return(data.frame(gene = gg, p_value_without = NA_real_,
+                      stringsAsFactors = FALSE))
+  }
+
+  idx_obs <- match(reduced, nodes_loo)
+  x_obs   <- integer(length(nodes_loo)); x_obs[idx_obs] <- 1L
+  obs_gm  <- global_moran_I(A_loo, x_obs)
+
+  set.seed(42L + which(gwas_on_net == gg)[1])
+  rand_gm <- numeric(n_perm_loo)
+  for (i in seq_len(n_perm_loo)) {
+    s     <- sample_degree_matched(reduced, bin_cache, num_bins = 10, replace = TRUE)
+    idx_s <- match(s, nodes_loo)
+    x_s   <- integer(length(nodes_loo)); x_s[idx_s] <- 1L
+    rand_gm[i] <- global_moran_I(A_loo, x_s)
+  }
+
+  data.frame(gene = gg, p_value_without = mean(rand_gm >= obs_gm),
+             stringsAsFactors = FALSE)
+}
+
+parallel::stopCluster(cl_gene)
+
+# Annotate with subgraph degree, network degree, component, articulation status
+gene_loo_tbl <- gene_loo_raw %>%
+  left_join(
+    tibble(
+      gene            = V(gwas_subg)$name,
+      subgraph_degree = degree(gwas_subg),
+      network_degree  = degree(largest_subgraph_undirected, v = V(gwas_subg)$name),
+      comp_id         = comp$membership,
+      comp_size       = comp$csize[comp$membership],
+      is_articulation_point = V(gwas_subg)$name %in% art_names
+    ),
+    by = "gene"
+  ) %>%
+  mutate(
+    p_value_full        = p_value_full,
+    delta_p             = p_value_without - p_value_full,
+    significant_without = p_value_without < 0.05
+  ) %>%
+  select(gene, subgraph_degree, network_degree, comp_id, comp_size,
+         is_articulation_point, p_value_without, p_value_full,
+         delta_p, significant_without) %>%
+  arrange(desc(delta_p))
+```
+
+```{r}
+#| label: gene-loo-top20
+gene_loo_tbl %>%
+  head(20) %>%
+  select(gene, subgraph_degree, network_degree, comp_id, comp_size,
+         is_articulation_point, p_value_without, delta_p, significant_without) %>%
+  knitr::kable(digits = 4,
+               caption = "Top 20 genes by LOO contribution (delta_p descending)")
+```
+
+```{r}
+#| label: gene-loo-datatable
+DT::datatable(
+  gene_loo_tbl,
+  options = list(pageLength = 25, scrollX = TRUE),
+  caption = "Full gene-level LOO table (browsable)"
+) %>%
+  DT::formatRound(columns = c("p_value_without", "p_value_full", "delta_p"),
+                  digits = 4)
+```
+
+```{r}
+#| label: plot-gene-loo-scatter
+#| fig-width: 10
+#| fig-height: 7
+scatter_df <- gene_loo_tbl %>%
+  mutate(comp_label = ifelse(comp_size == 1, "Singleton",
+                             paste0("C", comp_id)))
+
+ggplot(scatter_df, aes(x = subgraph_degree, y = delta_p, color = comp_label)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(size = 2.2, alpha = 0.8) +
+  ggrepel::geom_text_repel(
+    data = scatter_df %>% filter(is_articulation_point),
+    aes(label = gene),
+    size = 3, max.overlaps = 30, show.legend = FALSE
+  ) +
+  labs(
+    title = "Gene LOO: degree vs. contribution to Global Moran's I",
+    subtitle = "Articulation points labeled; color = component membership",
+    x     = "Subgraph degree",
+    y     = expression(Delta * "p = p(without) - p(full)"),
+    color = "Component"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+#| label: plot-gene-loo-top20-bar
+#| fig-width: 12
+#| fig-height: 6
+top20_df <- gene_loo_tbl %>%
+  head(20) %>%
+  mutate(gene = factor(gene, levels = gene[order(-delta_p)]))
+
+ggplot(top20_df, aes(x = gene, y = delta_p, fill = is_articulation_point)) +
+  geom_col(width = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_fill_manual(values = c("FALSE" = "steelblue", "TRUE" = "firebrick"),
+                    labels = c("FALSE" = "No", "TRUE" = "Yes")) +
+  labs(
+    title = "Top 20 genes by LOO contribution",
+    x     = "Gene",
+    y     = expression(Delta * "p = p(without) - p(full)"),
+    fill  = "Articulation\npoint"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+#| label: plot-gene-loo-singleton-hist
+#| fig-width: 10
+#| fig-height: 5
+singleton_df <- gene_loo_tbl %>% filter(comp_size == 1)
+
+sing_mean <- mean(singleton_df$delta_p, na.rm = TRUE)
+sing_sd   <- sd(singleton_df$delta_p,   na.rm = TRUE)
+
+ggplot(singleton_df, aes(x = delta_p)) +
+  geom_histogram(bins = 25, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  annotate("text", x = Inf, y = Inf, hjust = 1.1, vjust = 1.5,
+           label = sprintf("mean = %.4f\nsd = %.4f\nn = %d",
+                           sing_mean, sing_sd, nrow(singleton_df))) +
+  labs(
+    title    = "Singleton LOO delta_p distribution (sanity check)",
+    subtitle = "Expect delta_p ~ 0: singletons have no neighbors, so should not contribute to Global Moran's I",
+    x        = expression(Delta * "p"),
+    y        = "Count"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+#| label: gene-loo-spearman
+non_singleton <- gene_loo_tbl %>% filter(comp_size > 1)
+
+sp <- suppressWarnings(cor.test(
+  non_singleton$subgraph_degree,
+  non_singleton$delta_p,
+  method = "spearman"
+))
+
+cat("Spearman correlation (subgraph_degree vs delta_p, non-singletons only):\n")
+cat("  rho     =", round(sp$estimate, 4), "\n")
+cat("  p-value =", format.pval(sp$p.value), "\n")
+cat("  n       =", nrow(non_singleton), "\n")
+```
+
+# Summary
+
+```{r}
+#| label: final-summary
+cat("=== CRC GWAS Network Analysis Summary ===\n\n")
+
+cat("Gene set: ", length(gwas_on_net), " genes on network\n")
+cat("Degree bias: KS p =", format.pval(ks.test(deg_gwas, deg_all)$p.value), "\n\n")
+
+# Best degree-matched result (bins=4 as default reference)
+ref_bins <- 4
+ref_row <- stability_df %>% filter(stat == "ICS", ics_bins == ref_bins)
+if (nrow(ref_row) > 0) {
+  cat("ICS (bins=", ref_bins, "): p =", ref_row$p_value, "\n")
+}
+ref_row <- stability_df %>% filter(stat == "Global Moran's I", ics_bins == ref_bins)
+if (nrow(ref_row) > 0) {
+  cat("Global Moran (bins=", ref_bins, "): p =", ref_row$p_value, "\n")
+}
+ref_row <- stability_df %>% filter(stat == "Join count", ics_bins == ref_bins)
+if (nrow(ref_row) > 0) {
+  cat("Join count (bins=", ref_bins, "): p =", ref_row$p_value, "\n")
+}
+
+cat("\nSubgraph structure:\n")
+cat("  Connected components:", comp$no, "\n")
+cat("  Largest component:", max(comp$csize), "genes\n")
+cat("  Articulation points:", length(art_names), "/", length(gwas_on_net), "\n")
+if (nrow(art_impact) > 0) {
+  cat("  Max component increase on removal:",
+      max(art_impact$delta_components), "(gene:",
+      art_impact$gene[which.max(art_impact$delta_components)], ")\n")
+}
+```

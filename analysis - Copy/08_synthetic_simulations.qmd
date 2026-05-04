@@ -1,0 +1,174 @@
+---
+title: "Synthetic Simulations (Tier 1)"
+format: html
+editor: visual
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(igraph)
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(here)
+})
+
+source(here::here("R/stats.R"))
+source(here::here("R/sampling.R"))
+source(here::here("R/simulation_synthetic.R"))
+```
+
+```{r}
+largest_subgraph_undirected <- readRDS(here::here("networks", "largest_subgraph_undirected.rds"))
+bin_cache                   <- readRDS(here::here("networks", "degree_bin_cache.rds"))
+```
+
+# Scenario 1: Single BFS cluster
+
+Plant a tight topological cluster of 50 genes via BFS.
+
+```{r}
+set.seed(42)
+cluster_s1 <- plant_bfs_cluster(largest_subgraph_undirected, cluster_size = 50)
+length(cluster_s1)
+```
+
+```{r}
+n_total_vec <- c(100, 200, 500)
+
+res_s1 <- bind_rows(lapply(n_total_vec, function(nt) {
+  run_synthetic_scenario(
+    graph        = largest_subgraph_undirected,
+    signal_genes = cluster_s1,
+    n_total      = nt,
+    n_perm       = 500,
+    bin_cache    = bin_cache,
+    ics_bins_set = c(1, 4, 10),
+    seed         = 42
+  ) %>% mutate(n_total = nt)
+}))
+
+res_s1
+```
+
+# Scenario 2: Multiple dispersed BFS clusters
+
+Plant 3 clusters of 20 genes each, separated by \>= 5 hops.
+
+```{r}
+set.seed(123)
+dispersed <- plant_dispersed_clusters(
+  largest_subgraph_undirected,
+  n_clusters = 3, cluster_size = 20, min_separation = 5
+)
+
+cat("Signal genes:", length(dispersed$signal_genes), "\n")
+cat("Seeds:", dispersed$seeds, "\n")
+sapply(dispersed$clusters, length)
+```
+
+```{r}
+res_s2 <- bind_rows(lapply(n_total_vec, function(nt) {
+  run_synthetic_scenario(
+    graph        = largest_subgraph_undirected,
+    signal_genes = dispersed$signal_genes,
+    n_total      = nt,
+    n_perm       = 500,
+    bin_cache    = bin_cache,
+    ics_bins_set = c(1, 4, 10),
+    seed         = 123
+  ) %>% mutate(n_total = nt)
+}))
+
+res_s2
+```
+
+# Scenario 3: Dispersed hub genes (false positive control)
+
+Select 50 high-degree genes that are NOT topologically clustered. Expect: significant under uniform null, NOT significant under degree-matched null.
+
+```{r}
+set.seed(456)
+hubs <- select_dispersed_hubs(largest_subgraph_undirected, n_hubs = 50)
+cat("Hub genes selected:", length(hubs), "\n")
+cat("Mean degree:", mean(degree(largest_subgraph_undirected, v = hubs)), "\n")
+```
+
+```{r}
+res_s3 <- bind_rows(lapply(n_total_vec, function(nt) {
+  run_synthetic_scenario(
+    graph        = largest_subgraph_undirected,
+    signal_genes = hubs,
+    n_total      = nt,
+    n_perm       = 500,
+    bin_cache    = bin_cache,
+    ics_bins_set = c(1, 4, 10),
+    seed         = 456
+  ) %>% mutate(n_total = nt)
+}))
+
+res_s3
+```
+
+# Scenario 7: Degree-matched cluster (confound validator)
+
+Plant a BFS cluster whose degree distribution matches the network background.
+
+```{r}
+#| include: false
+set.seed(789)
+deg_matched <- plant_degree_matched_cluster(
+  largest_subgraph_undirected,
+  cluster_size = 50,
+  max_attempts = 100
+)
+
+cat("KS test p-value:", deg_matched$ks_pvalue, "\n")
+cat("Signal genes:", length(deg_matched$signal_genes), "\n")
+```
+
+```{r}
+res_s7 <- bind_rows(lapply(n_total_vec, function(nt) {
+  run_synthetic_scenario(
+    graph        = largest_subgraph_undirected,
+    signal_genes = deg_matched$signal_genes,
+    n_total      = nt,
+    n_perm       = 500,
+    bin_cache    = bin_cache,
+    ics_bins_set = c(1, 4, 10),
+    seed         = 789
+  ) %>% mutate(n_total = nt)
+}))
+
+res_s7
+```
+
+# Summary comparison
+
+```{r}
+all_res <- bind_rows(
+  res_s1 %>% mutate(scenario = "S1: Single BFS cluster"),
+  res_s2 %>% mutate(scenario = "S2: Dispersed clusters"),
+  res_s3 %>% mutate(scenario = "S3: Dispersed hubs"),
+  res_s7 %>% mutate(scenario = "S7: Degree-matched cluster")
+)
+
+all_res %>%
+  select(scenario, n_total, method, p_value) %>%
+  pivot_wider(names_from = method, values_from = p_value)
+```
+
+```{r}
+ggplot(all_res, aes(x = method, y = -log10(pmax(p_value, 1e-4)),
+                    fill = factor(n_total))) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ scenario, scales = "free_x") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  labs(
+    title = "Synthetic Scenarios: -log10(p) by method and sample size",
+    x = "Method", y = "-log10(p-value)", fill = "n_total"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```

@@ -1,0 +1,372 @@
+---
+title: "Leave-One-Out Analysis"
+format: html
+editor: visual
+---
+
+```{r}
+#| label: setup
+suppressPackageStartupMessages({
+  library(igraph)
+  library(dplyr)
+  library(ggplot2)
+  library(here)
+})
+
+source(here::here("R/stats.R"))
+source(here::here("R/loo.R"))
+source(here::here("R/plotting.R"))
+```
+
+```{r}
+#| label: load-data
+largest_subgraph_undirected <- readRDS(here::here("networks", "largest_subgraph_undirected.rds"))
+pathway_stats               <- readRDS(here::here("pathway_info", "pathway_stats.rds"))
+```
+
+# Validate loo_gene() against brute-force
+
+Run both the optimized (articulation-point) and naive (brute-force) versions on a small pathway and confirm deltas match to floating-point tolerance.
+
+```{r}
+#| label: validation-setup
+# Pick a small pathway for validation (~20-30 genes)
+small_pw <- pathway_stats %>%
+  mutate(n_on_net = sapply(Genes, function(g) length(intersect(unique(unlist(g)), V(largest_subgraph_undirected)$name)))) %>%
+  filter(n_on_net >= 15, n_on_net <= 40) %>%
+  slice(1)
+
+val_nodes <- intersect(unique(unlist(small_pw$Genes)), V(largest_subgraph_undirected)$name)
+cat("Validation pathway:", small_pw$PATHWAY_NAMES, "\n")
+cat("Genes on network:", length(val_nodes), "\n")
+```
+
+```{r}
+#| label: validation-run
+loo_fast  <- loo_gene(largest_subgraph_undirected, val_nodes)
+loo_naive <- loo_gene_naive(largest_subgraph_undirected, val_nodes)
+
+# Merge and compare
+merged <- merge(
+  loo_fast[, c("gene", "delta")],
+  loo_naive[, c("gene", "delta")],
+  by = "gene", suffixes = c("_fast", "_naive")
+)
+
+max_diff <- max(abs(merged$delta_fast - merged$delta_naive), na.rm = TRUE)
+cat("Max absolute difference:", max_diff, "\n")
+stopifnot(max_diff < 1e-12)
+cat("VALIDATION PASSED: loo_gene() matches brute-force within floating-point tolerance.\n")
+```
+
+# Single pathway LOO: Downstream TCR signaling
+
+```{r}
+#| label: single-pathway-setup
+pathway_name <- "Downstream TCR signaling"
+
+row <- pathway_stats %>% filter(PATHWAY_NAMES == pathway_name)
+tcr_nodes <- intersect(unique(unlist(row$Genes)), V(largest_subgraph_undirected)$name)
+cat("Pathway:", pathway_name, "\n")
+cat("Genes on network:", length(tcr_nodes), "\n")
+```
+
+## Component-level LOO
+
+```{r}
+#| label: single-comp-loo
+comp_loo <- loo_component(largest_subgraph_undirected, tcr_nodes)
+comp_loo %>% select(comp_id, comp_size, ics_full, ics_without, delta) %>% arrange(desc(abs(delta)))
+```
+
+```{r}
+#| label: single-comp-plot
+plot_loo_components(comp_loo, title = paste0("Component LOO: ", pathway_name))
+```
+
+```{r}
+#| label: single-comp-summary
+cat("Total components:", nrow(comp_loo), "\n")
+cat("Largest component:", max(comp_loo$comp_size), "genes\n")
+cat("Components with |delta| > 0.01:", sum(abs(comp_loo$delta) > 0.01), "\n")
+```
+
+## Gene-level LOO
+
+```{r}
+#| label: single-gene-loo
+gene_loo <- loo_gene(largest_subgraph_undirected, tcr_nodes)
+```
+
+```{r}
+#| label: single-gene-summary
+cat("Total genes:", nrow(gene_loo), "\n")
+cat("Articulation points:", sum(gene_loo$is_articulation), "\n")
+cat("Non-articulation (analytical):", sum(!gene_loo$is_articulation), "\n")
+```
+
+```{r}
+#| label: single-gene-plot
+plot_loo_importance_vs_contribution(gene_loo, title = paste0("Gene LOO: ", pathway_name))
+```
+
+```{r}
+#| label: single-gene-cor
+cor_val <- cor(gene_loo$subgraph_degree, gene_loo$delta,
+               use = "complete.obs", method = "spearman")
+cat("Spearman correlation (degree vs delta):", round(cor_val, 3), "\n")
+```
+
+## Degree diagnostic
+
+```{r}
+#| label: single-degree
+plot_degree_diagnostic(largest_subgraph_undirected, tcr_nodes,
+                       title = paste0("Degree distribution: ", pathway_name, " vs background"))
+```
+
+```{r}
+#| label: single-degree-stats
+deg_all <- degree(largest_subgraph_undirected)
+deg_pw  <- degree(largest_subgraph_undirected, v = tcr_nodes)
+
+cat("Network mean degree:", round(mean(deg_all), 2), "\n")
+cat("Pathway mean degree:", round(mean(deg_pw), 2), "\n")
+cat("KS test p-value:", ks.test(deg_pw, deg_all)$p.value, "\n")
+```
+
+## Top genes tables
+
+```{r}
+#| label: single-top-delta
+# Top 10 by |delta| (highest contribution to ICS)
+gene_loo %>%
+  arrange(desc(abs(delta))) %>%
+  select(gene, subgraph_degree, is_articulation, comp_size, delta) %>%
+  head(10)
+```
+
+```{r}
+#| label: single-top-degree
+# Top 10 by subgraph degree (most connected within pathway)
+gene_loo %>%
+  arrange(desc(subgraph_degree)) %>%
+  select(gene, subgraph_degree, is_articulation, comp_size, delta) %>%
+  head(10)
+```
+
+```{r}
+#| label: single-bridges
+# High contribution but low importance (interesting bridges)
+gene_loo %>%
+  filter(subgraph_degree <= median(subgraph_degree, na.rm = TRUE)) %>%
+  arrange(desc(abs(delta))) %>%
+  select(gene, subgraph_degree, is_articulation, comp_size, delta) %>%
+  head(10)
+```
+
+# Multi-pathway LOO: 3 pathways + noise
+
+Combine genes from 3 pathways and add random noise genes, then run LOO to examine which genes and components drive the ICS signal in a realistic multi-source gene set.
+
+```{r}
+#| label: multi-setup
+multi_pathways <- c(
+  "Downstream TCR signaling",
+  "Regulation of insulin secretion",
+  "Cadherin signaling pathway"
+)
+
+nodes <- V(largest_subgraph_undirected)$name
+
+# Collect genes per pathway
+pw_gene_lists <- lapply(multi_pathways, function(pw) {
+  row <- pathway_stats %>% filter(PATHWAY_NAMES == pw)
+  intersect(unique(unlist(row$Genes)), nodes)
+})
+names(pw_gene_lists) <- multi_pathways
+
+for (pw in multi_pathways) {
+  cat(pw, ":", length(pw_gene_lists[[pw]]), "genes on network\n")
+}
+
+# Union of pathway genes
+signal_pool <- unique(unlist(pw_gene_lists))
+cat("\nUnion of pathway genes:", length(signal_pool), "\n")
+
+# Add noise: 30% of total set size
+set.seed(42)
+n_noise <- as.integer(round(length(signal_pool) * 0.3))
+noise_genes <- sample(setdiff(nodes, signal_pool), n_noise)
+cat("Noise genes:", n_noise, "\n")
+
+multi_target <- c(signal_pool, noise_genes)
+cat("Total multi-pathway set:", length(multi_target), "\n")
+```
+
+```{r}
+#| label: multi-origin
+# Label each gene by its origin (pathway 1, 2, 3, multi, or noise)
+gene_origin <- data.frame(gene = multi_target, stringsAsFactors = FALSE)
+gene_origin$origin <- sapply(gene_origin$gene, function(g) {
+  in_pw <- sapply(pw_gene_lists, function(gl) g %in% gl)
+  n_pw <- sum(in_pw)
+  if (n_pw == 0) return("Noise")
+  if (n_pw > 1) return("Multi-pathway")
+  names(which(in_pw))
+})
+table(gene_origin$origin)
+```
+
+## Multi-pathway component-level LOO
+
+```{r}
+#| label: multi-comp-loo
+comp_loo_multi <- loo_component(largest_subgraph_undirected, multi_target)
+comp_loo_multi %>%
+  select(comp_id, comp_size, ics_full, ics_without, delta) %>%
+  arrange(desc(abs(delta)))
+```
+
+```{r}
+#| label: multi-comp-plot
+plot_loo_components(comp_loo_multi, title = "Component LOO: 3-pathway + noise mixture")
+```
+
+```{r}
+#| label: multi-comp-composition
+# For each component, what fraction of genes come from each origin?
+for (i in seq_len(nrow(comp_loo_multi))) {
+  cg <- comp_loo_multi$comp_genes[[i]]
+  origins <- gene_origin$origin[match(cg, gene_origin$gene)]
+  if (length(cg) >= 3) {
+    cat("Component", comp_loo_multi$comp_id[i],
+        "(n=", comp_loo_multi$comp_size[i],
+        ", delta=", round(comp_loo_multi$delta[i], 4), "):",
+        paste(names(table(origins)), table(origins), sep = "=", collapse = ", "), "\n")
+  }
+}
+```
+
+## Multi-pathway gene-level LOO
+
+```{r}
+#| label: multi-gene-loo
+gene_loo_multi <- loo_gene(largest_subgraph_undirected, multi_target)
+```
+
+```{r}
+#| label: multi-gene-summary
+cat("Total genes:", nrow(gene_loo_multi), "\n")
+cat("Articulation points:", sum(gene_loo_multi$is_articulation), "\n")
+cat("Non-articulation:", sum(!gene_loo_multi$is_articulation), "\n")
+```
+
+```{r}
+#| label: multi-gene-plot
+#| fig-width: 10
+#| fig-height: 7
+# Annotate with origin
+gene_loo_multi <- gene_loo_multi %>%
+  left_join(gene_origin, by = "gene")
+
+ggplot(gene_loo_multi, aes(x = subgraph_degree, y = delta, color = origin)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_smooth(aes(group = 1), method = "lm", se = TRUE,
+              color = "grey40", linetype = "dashed") +
+  geom_hline(yintercept = 0, linewidth = 0.5) +
+  labs(
+    title = "Gene LOO: 3-pathway + noise mixture",
+    subtitle = paste0("Spearman r = ",
+                      round(cor(gene_loo_multi$subgraph_degree,
+                                gene_loo_multi$delta,
+                                use = "complete.obs", method = "spearman"), 3)),
+    x     = "Subgraph degree",
+    y     = "LOO delta",
+    color = "Gene origin"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## LOO delta by origin
+
+Do pathway genes contribute more to ICS than noise genes?
+
+```{r}
+#| label: multi-delta-by-origin
+gene_loo_multi %>%
+  group_by(origin) %>%
+  summarise(
+    n         = n(),
+    mean_delta = mean(delta, na.rm = TRUE),
+    sd_delta   = sd(delta, na.rm = TRUE),
+    n_art      = sum(is_articulation),
+    mean_degree = mean(subgraph_degree),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_delta)) %>%
+  knitr::kable(digits = 4,
+               caption = "LOO delta summary by gene origin")
+```
+
+```{r}
+#| label: multi-delta-boxplot
+#| fig-width: 10
+#| fig-height: 5
+ggplot(gene_loo_multi, aes(x = origin, y = delta, fill = origin)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 1) +
+  geom_hline(yintercept = 0, linewidth = 0.5) +
+  labs(
+    title = "LOO delta distribution by gene origin",
+    x     = "Origin",
+    y     = "LOO delta (contribution to ICS)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+## Top contributing genes (multi-pathway)
+
+```{r}
+#| label: multi-top-delta
+gene_loo_multi %>%
+  arrange(desc(abs(delta))) %>%
+  select(gene, origin, subgraph_degree, is_articulation, comp_size, delta) %>%
+  head(15) %>%
+  knitr::kable(digits = 4,
+               caption = "Top 15 genes by |delta| in 3-pathway mixture")
+```
+
+```{r}
+#| label: multi-noise-contribution
+# What fraction of top-20 |delta| genes are noise?
+top20 <- gene_loo_multi %>%
+  arrange(desc(abs(delta))) %>%
+  head(20)
+cat("Noise genes in top 20 by |delta|:", sum(top20$origin == "Noise"), "/", 20, "\n")
+cat("Multi-pathway genes in top 20:", sum(top20$origin == "Multi-pathway"), "/", 20, "\n")
+```
+
+# Summary
+
+```{r}
+#| label: summary
+cat("=== Single pathway LOO (", pathway_name, ") ===\n")
+cat("Components:", nrow(comp_loo), "\n")
+cat("Articulation points:", sum(gene_loo$is_articulation), "/", nrow(gene_loo), "\n")
+cat("Degree-delta Spearman r:", round(cor_val, 3), "\n\n")
+
+cat("=== Multi-pathway LOO (3 pathways + 30% noise) ===\n")
+cat("Total genes:", nrow(gene_loo_multi), "\n")
+cat("Components:", nrow(comp_loo_multi), "\n")
+cat("Articulation points:", sum(gene_loo_multi$is_articulation), "/", nrow(gene_loo_multi), "\n")
+cat("Degree-delta Spearman r:",
+    round(cor(gene_loo_multi$subgraph_degree, gene_loo_multi$delta,
+              use = "complete.obs", method = "spearman"), 3), "\n")
+
+# Signal vs noise separation
+signal_delta <- mean(gene_loo_multi$delta[gene_loo_multi$origin != "Noise"], na.rm = TRUE)
+noise_delta  <- mean(gene_loo_multi$delta[gene_loo_multi$origin == "Noise"], na.rm = TRUE)
+cat("Mean delta (signal genes):", round(signal_delta, 5), "\n")
+cat("Mean delta (noise genes):", round(noise_delta, 5), "\n")
+```

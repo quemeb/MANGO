@@ -1,0 +1,99 @@
+---
+title: "Pathway Characterization"
+format: html
+editor: visual
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(igraph)
+  library(dplyr)
+  library(ggplot2)
+  library(here)
+})
+
+source(here::here("R/stats.R"))
+source(here::here("R/pathway_characterization.R"))
+```
+
+```{r}
+largest_subgraph_undirected <- readRDS(here::here("networks", "largest_subgraph_undirected.rds"))
+pathway_stats               <- readRDS(here::here("pathway_info", "pathway_stats.rds"))
+```
+
+# Characterize all pathways
+
+```{r}
+#| include: false
+pw_char <- characterize_all_pathways(
+  graph        = largest_subgraph_undirected,
+  pathway_data = pathway_stats,
+  min_genes    = 10
+)
+
+pw_char <- pw_char %>% arrange(desc(n_genes))
+pw_char
+```
+
+# Summary statistics
+
+```{r}
+pw_char %>%
+  summarise(
+    n_pathways       = n(),
+    median_genes     = median(n_genes),
+    median_components = median(n_components),
+    median_frac_iso  = round(median(frac_isolated), 3),
+    median_sub_deg   = round(median(mean_subgraph_deg), 2)
+  )
+```
+
+# Candidate pathway selection
+
+Select pathways for Tier 2 simulations across size and connectivity strata.
+
+```{r}
+# Small well-connected pathways (20-50 genes, few components)
+small_pw <- pw_char %>%
+  filter(n_genes >= 20, n_genes <= 50, n_components <= 3) %>%
+  arrange(n_components, desc(mean_subgraph_deg)) %>%
+  head(3)
+
+small_pw
+```
+
+```{r}
+# Medium pathways (100-200 genes)
+medium_pw <- pw_char %>%
+  filter(n_genes >= 100, n_genes <= 200) %>%
+  arrange(desc(mean_subgraph_deg)) %>%
+  head(3)
+
+medium_pw
+```
+
+```{r}
+# Large pathways (400+ genes)
+large_pw <- pw_char %>%
+  filter(n_genes >= 400) %>%
+  arrange(desc(mean_subgraph_deg)) %>%
+  head(2)
+
+large_pw
+```
+
+```{r}
+# Fragmented pathways (high frac_isolated) for contrast
+fragmented_pw <- pw_char %>%
+  filter(n_genes >= 20, frac_isolated >= 0.3) %>%
+  arrange(desc(frac_isolated)) %>%
+  head(3)
+
+fragmented_pw
+```
+
+# Save characterization
+
+```{r}
+saveRDS(pw_char, here::here("pathway_info", "pathway_characterization.rds"))
+```

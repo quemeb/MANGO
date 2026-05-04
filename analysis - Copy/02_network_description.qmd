@@ -1,0 +1,221 @@
+---
+title: "Network Description"
+format: html
+editor: visual
+---
+
+```{r Libraries}
+library(paxtoolsr)
+library(igraph)
+library(stringr)
+library(ggplot2)
+library(tidyverse)
+library(ggraph)
+library(here)
+```
+
+```{r Source}
+source(here::here("R/sampling.R"))
+```
+
+```{r}
+largest_subgraph <- readRDS(here::here("networks", "largest_subgraph_directed.rds"))
+largest_subgraph_undirected <- readRDS(here::here("networks", "largest_subgraph_undirected.rds"))
+```
+
+```{r Edge counts}
+print(paste("Edges in directed: ", ecount(largest_subgraph)))
+print(paste("Edges in undirected: ", ecount(largest_subgraph_undirected)))
+```
+
+```{r}
+print(paste("Nodes in graph: ", vcount(largest_subgraph)))
+```
+
+
+```{r Diameter}
+# Calculate the diameter of the graph (undirected)
+largest_subgraph_diameter <- diameter(largest_subgraph, directed = FALSE)
+largest_subgraph_diameter_ids <- get_diameter(largest_subgraph, directed = FALSE)
+
+# Find the shortest distance between the diameter endpoints
+di_start <- largest_subgraph_diameter_ids[1]
+di_end <- largest_subgraph_diameter_ids[length(largest_subgraph_diameter_ids)]
+di_shortest_distances <- distances(largest_subgraph, v = di_start, to = di_end)
+
+# Print results
+if (largest_subgraph_diameter == di_shortest_distances) {
+  print(paste("The diameter AND the shortest distance between the two extremums is:", largest_subgraph_diameter))
+} else {
+  print(paste("The diameter of the graph is:", largest_subgraph_diameter))
+  print(paste("However, the shortest distance between the two extremums is:", di_shortest_distances))
+}
+
+# Calculate the diameter of the graph (directed)
+directed_diameter <- diameter(largest_subgraph, directed = TRUE)
+directed_diameter_ids <- get_diameter(largest_subgraph, directed = TRUE)
+
+# Find the shortest distance between the diameter endpoints (directed)
+di_start_directed <- directed_diameter_ids[1]
+di_end_directed <- directed_diameter_ids[length(directed_diameter_ids)]
+di_shortest_distances_directed <- distances(largest_subgraph, v = di_start_directed, to = di_end_directed)
+
+# Print results
+if (directed_diameter == di_shortest_distances_directed) {
+  print(paste("The directed diameter AND the shortest distance between the two extremums is:", directed_diameter))
+} else {
+  print(paste("The directed diameter of the graph is:", directed_diameter))
+  print(paste("However, the shortest distance between the two extremums is:", di_shortest_distances_directed))
+}
+```
+
+```{r}
+mean_path_length_undirected <- mean_distance(largest_subgraph_undirected, directed = FALSE)
+path_length_distribution_undirected <- distances(largest_subgraph_undirected)
+
+path_length_values_undirected <- path_length_distribution_undirected[lower.tri(path_length_distribution_undirected)]
+
+# Plot undirected histogram
+hist(path_length_values_undirected,
+     breaks = seq(min(path_length_values_undirected), max(path_length_values_undirected), by = 1),
+     main = "Path Length Distribution (Undirected)",
+     xlab = "Path Length", ylab = "Proportion",
+     col = "lightblue", border = "black", freq = FALSE, labels = TRUE)
+
+# Print undirected stats
+cat("Undirected mean path length:", mean_path_length_undirected, "\n")
+cat("Undirected SD:", sd(path_length_values_undirected), "\n")
+```
+
+```{r Clustering Coefficients}
+# Clustering Coefficients
+global_clustering <- transitivity(largest_subgraph, type = "global")
+local_clustering <- transitivity(largest_subgraph, type = "localaverage")
+
+# Print statistics
+print(paste("Global Clustering Coefficient: ", global_clustering))
+print(paste("Average Local Clustering Coefficient: ", local_clustering))
+```
+
+```{r}
+deg <- degree(largest_subgraph_undirected)              # exact degree per node
+deg_df <- data.frame(degree = deg)
+
+ggplot(deg_df, aes(x = degree)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "black") +
+  labs(
+    title = "Degree Distribution",
+    x = "Degree",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+gene_pathway_list <- readRDS(here::here("pathway_info", "gene_pathway_info.rds"))
+# Get the vertex names in the largest subgraph
+largest_subgraph_vertices <- V(largest_subgraph)$name
+
+# Filter edges from the original data based on vertices in the largest subgraph
+largest_subgraph_edges <- gene_pathway_list %>%
+  filter(
+    PARTICIPANT_A %in% largest_subgraph_vertices |
+    PARTICIPANT_B %in% largest_subgraph_vertices
+  )
+
+# Count unique pathways
+num_pathways_largest_subgraph <- length(unique(largest_subgraph_edges$PATHWAY_NAMES))
+cat("Number of unique pathways in the largest subgraph:", num_pathways_largest_subgraph, "\n")
+```
+
+```{r genes per pathway}
+
+# Faster membership filtering
+v_keep <- V(largest_subgraph_undirected)$name
+v_keep <- unique(v_keep)  # just in case
+
+largest_subgraph_edges <- gene_pathway_list %>%
+  filter(PARTICIPANT_A %in% v_keep, PARTICIPANT_B %in% v_keep)
+
+pathway_genes <- largest_subgraph_edges %>%
+  group_by(PATHWAY_NAMES) %>%
+  summarise(Genes = list(unique(c(PARTICIPANT_A, PARTICIPANT_B))), .groups = "drop")
+
+pathway_stats <- pathway_genes %>%
+  mutate(
+    num_genes = map_int(Genes, length),
+    mean_path_length = map_dbl(Genes, function(g) {
+      if (length(g) <= 1) return(NA_real_)
+      dm <- distances(largest_subgraph_undirected, v = g, to = g)
+      vals <- dm[lower.tri(dm)]
+      vals <- vals[is.finite(vals)]  # protects against Inf if subset isn't connected
+      if (length(vals) == 0) NA_real_ else mean(vals)
+    }),
+    sd_path_length = map_dbl(Genes, function(g) {
+      if (length(g) <= 1) return(NA_real_)
+      dm <- distances(largest_subgraph_undirected, v = g, to = g)
+      vals <- dm[lower.tri(dm)]
+      vals <- vals[is.finite(vals)]
+      if (length(vals) <= 1) NA_real_ else sd(vals)
+    })
+  )
+
+print(pathway_stats)
+
+saveRDS(pathway_stats, file = here::here("pathway_info", "pathway_stats.rds"), compress = "xz")
+
+# Histogram of genes per pathway
+p_hist <- ggplot(pathway_stats, aes(x = num_genes)) +
+  geom_histogram(binwidth = 10, fill = "lightblue", color = "black") +
+  labs(
+    title = "Distribution of Number of Genes per Pathway",
+    x = "Number of Genes",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+print(p_hist)
+
+```
+
+```{r}
+deg <- degree(largest_subgraph_undirected)
+
+node_names <- V(largest_subgraph_undirected)$name
+
+bin_cache <- build_bin_cache(deg, node_names, max_bins = 10)
+
+saveRDS(bin_cache, file = here::here("networks", "degree_bin_cache.rds"), compress = "xz")
+```
+
+```{r}
+bin_cache$bins_5$breaks
+bin_cache$bins_5$node_table
+
+```
+
+```{r}
+cuts <- bin_cache$bins_5$breaks
+
+deg_counts <- as.data.frame(table(deg)) %>%
+  mutate(
+    deg = as.integer(as.character(deg)),
+    count = as.integer(Freq)
+  ) %>%
+  select(deg, count)
+
+p <- ggplot(deg_counts, aes(x = deg, y = count)) +
+  geom_col(width = 0.9, fill = "grey80", color = "black") +
+  geom_vline(xintercept = cuts, linetype = "dashed", linewidth = 0.7, color = "red") +
+  coord_cartesian(xlim = c(0, 50)) +
+  labs(
+    title = "Degree Distribution (Exact Counts per Degree, Zoomed to ≤110)",
+    x = "Degree",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+print(p)
+cuts
+
+```

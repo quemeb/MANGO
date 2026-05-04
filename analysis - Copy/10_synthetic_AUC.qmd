@@ -1,0 +1,1071 @@
+---
+title: "Synthetic Scenario AUC Analysis"
+format: html
+editor: visual
+---
+
+```{r}
+#| label: setup
+suppressPackageStartupMessages({
+  library(igraph)
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(purrr)
+  library(foreach)
+  library(doParallel)
+  library(here)
+})
+
+source(here::here("R/stats.R"))
+source(here::here("R/sampling.R"))
+source(here::here("R/simulation_synthetic.R"))
+source(here::here("R/auc.R"))
+source(here::here("R/plotting.R"))
+```
+
+```{r}
+#| label: load-data
+largest_subgraph_undirected <- readRDS(here::here("networks", "largest_subgraph_undirected.rds"))
+bin_cache                   <- readRDS(here::here("networks", "degree_bin_cache.rds"))
+```
+
+# Shared parameters
+
+```{r}
+#| label: params
+n_total_vec    <- c(100, 200, 500)
+reps_per_level <- 100
+n_perm         <- 1000
+ics_bins_set   <- 1:10
+n_cores        <- 7
+```
+
+# AUC engine
+
+For each replicate: creates an alternative gene set (planted signal + noise) and a null gene set (pure random), computes p-values for all methods under shared degree-matched null, then computes AUC across replicates.
+
+```{r}
+#| label: auc-engine
+run_synthetic_auc_parallel <- function(
+  graph,
+  signal_genes,
+  n_total_vec,
+  reps_per_level = 50,
+  n_perm         = 500,
+  bin_cache,
+  ics_bins_set   = c(1, 4, 10),
+  n_cores        = 7,
+  scenario_name  = "Synthetic",
+  seed           = 1
+) {
+  prep  <- prep_graph_fast(graph)
+  g     <- prep$g
+  A     <- prep$A
+  nodes <- prep$nodes
+
+  signal_genes <- intersect(signal_genes, nodes)
+  background   <- setdiff(nodes, signal_genes)
+
+  # Task grid: n_total × rep × label (1 = alternative, 0 = null)
+  task_df <- expand.grid(
+    n_total = n_total_vec,
+    rep     = seq_len(reps_per_level),
+    label   = c(1L, 0L),
+    stringsAsFactors = FALSE
+  ) %>% mutate(task_id = row_number())
+
+  cl <- parallel::makeCluster(n_cores)
+  on.exit(parallel::stopCluster(cl), add = TRUE)
+  doParallel::registerDoParallel(cl)
+
+  parallel::clusterEvalQ(cl, {
+    suppressPackageStartupMessages({ library(igraph); library(Matrix) })
+    NULL
+  })
+
+  parallel::clusterExport(
+    cl,
+    varlist = c(
+      "g", "A", "nodes", "signal_genes", "background",
+      "n_perm", "ics_bins_set", "seed", "bin_cache", "scenario_name",
+      "ics_norm", "fast_joincount", "global_moran_I",
+      "sample_degree_matched"
+    ),
+    envir = environment()
+  )
+
+  res_long <- foreach(
+    ii = seq_len(nrow(task_df)),
+    .combine = dplyr::bind_rows,
+    .packages = c("igraph", "Matrix", "dplyr")
+  ) %dopar% {
+
+    nt     <- task_df$n_total[ii]
+    label  <- task_df$label[ii]
+    rep_id <- task_df$rep[ii]
+
+    set.seed(seed + ii)
+
+    n_sig   <- min(length(signal_genes), nt)
+    n_noise <- nt - n_sig
+
+    if (label == 1L) {
+      # Alternative: planted signal + random noise
+      target_nodes <- c(
+        sample(signal_genes, n_sig),
+        if (n_noise > 0) sample(background, n_noise) else character(0)
+      )
+    } else {
+      # Null: pure random
+      target_nodes <- sample(nodes, nt, replace = FALSE)
+    }
+
+    idx_target <- match(target_nodes, nodes)
+    x_obs <- integer(length(nodes)); x_obs[idx_target] <- 1L
+
+    obs_ics <- ics_norm(induced_subgraph(g, vids = target_nodes))
+    obs_gm  <- global_moran_I(A, x_obs)
+    obs_jc  <- fast_joincount(A, x_obs)
+
+    # Degree-matched null per bin scheme — shared sample for ALL methods
+    all_out <- list()
+
+    for (b in ics_bins_set) {
+      rand_ics <- numeric(n_perm)
+      rand_gm  <- numeric(n_perm)
+      rand_jc  <- numeric(n_perm)
+
+      for (p in seq_len(n_perm)) {
+        sset <- if (b > 1) {
+          sample_degree_matched(target_nodes, bin_cache,
+                                num_bins = b, replace = TRUE)
+        } else {
+          sample(nodes, nt, replace = TRUE)
+        }
+        idx_s <- match(sset, nodes)
+        x_s   <- integer(length(nodes)); x_s[idx_s] <- 1L
+
+        rand_ics[p] <- ics_norm(induced_subgraph(g, vids = sset))
+        rand_gm[p]  <- global_moran_I(A, x_s)
+        rand_jc[p]  <- fast_joincount(A, x_s)
+      }
+
+      null_label <- if (b > 1) paste0("dm_bins=", b) else "uniform"
+
+      all_out[[length(all_out) + 1]] <- c(
+        setNames(mean(rand_ics <= obs_ics), paste0("ICS_bins=", b)),
+        setNames(mean(rand_gm >= obs_gm),   paste0("GlobalMoran_", null_label)),
+        setNames(mean(rand_jc >= obs_jc),   paste0("Joincount_", null_label))
+      )
+    }
+
+    out <- unlist(all_out)
+
+    data.frame(
+      scenario = scenario_name,
+      n_total  = nt,
+      rep      = rep_id,
+      label    = label,
+      method   = names(out),
+      p_value  = as.numeric(out),
+      stringsAsFactors = FALSE
+    )
+  }
+
+  res_long %>% mutate(score = -log10(pmax(p_value, 1e-300)))
+}
+```
+
+```{r}
+#| label: auc-helpers
+compute_auc_table <- function(res_long) {
+  res_long %>%
+    group_by(scenario, n_total, method) %>%
+    group_modify(~ {
+      ra <- roc_auc_from_p(.x, score_col = "score", label_col = "label")
+      tibble(auc = ra$auc, roc = list(ra$roc))
+    }) %>%
+    ungroup()
+}
+
+compute_tpr_table <- function(auc_tbl, fpr_target = 0.05) {
+  auc_tbl %>%
+    transmute(
+      scenario, n_total, method, auc,
+      tpr_at_fpr = map_dbl(roc, ~ max(.x$TPR[.x$FPR <= fpr_target], na.rm = TRUE))
+    ) %>%
+    arrange(scenario, n_total, desc(tpr_at_fpr))
+}
+```
+
+# Plant signal sets
+
+```{r}
+#| label: plant-signals
+set.seed(42)
+signal_s1 <- plant_bfs_cluster(largest_subgraph_undirected, cluster_size = 50)
+cat("S1 signal genes:", length(signal_s1), "\n")
+subg_s1 <- induced_subgraph(largest_subgraph_undirected, vids = signal_s1)
+cat("S1 components:", components(subg_s1)$no,
+    " | density:", round(edge_density(subg_s1), 4), "\n")
+
+set.seed(123)
+dispersed_s2 <- plant_dispersed_clusters(
+  largest_subgraph_undirected,
+  n_clusters = 3, cluster_size = 20, min_separation = 5
+)
+signal_s2 <- dispersed_s2$signal_genes
+cat("S2 signal genes:", length(signal_s2),
+    " | seeds:", dispersed_s2$seeds,
+    " | cluster sizes:", sapply(dispersed_s2$clusters, length), "\n")
+
+set.seed(789)
+deg_matched_s7 <- plant_degree_matched_cluster(
+  largest_subgraph_undirected, cluster_size = 50, max_attempts = 200
+)
+signal_s7 <- deg_matched_s7$signal_genes
+cat("S7 signal genes:", length(signal_s7),
+    " | KS p =", round(deg_matched_s7$ks_pvalue, 4), "\n")
+
+set.seed(456)
+hubs_s3 <- select_dispersed_hubs(largest_subgraph_undirected, n_hubs = 50)
+cat("S3 hub genes:", length(hubs_s3),
+    " | mean degree:", round(mean(degree(largest_subgraph_undirected, v = hubs_s3)), 1), "\n")
+
+# S8: Degree-typical dispersed (GWAS-like: small clusters + singletons)
+s8_result <- plant_degree_typical_dispersed(
+  largest_subgraph_undirected,
+  n_signal = 50, n_small_clusters = 3, cluster_size = c(5, 8),
+  ks_alpha = 0.05, max_attempts = 500, seed = 888
+)
+signal_s8 <- s8_result$signal_genes
+cat("S8 signal genes:", length(signal_s8),
+    " | clusters:", length(s8_result$clusters),
+    " | singletons:", length(s8_result$singletons),
+    " | KS p =", round(s8_result$ks_pvalue, 4),
+    " | attempts:", s8_result$n_attempts, "\n")
+
+# S3b: Degree-typical dispersed null (no clustering)
+s3b_result <- select_degree_typical_dispersed(
+  largest_subgraph_undirected,
+  n_genes = 50, ks_alpha = 0.05, max_attempts = 500, seed = 999
+)
+signal_s3b <- s3b_result$genes
+cat("S3b null genes:", length(signal_s3b),
+    " | KS p =", round(s3b_result$ks_pvalue, 4),
+    " | attempts:", s3b_result$n_attempts, "\n")
+```
+
+## KS degree diagnostics for all signal sets
+
+```{r}
+#| label: ks-diagnostics
+net_degs <- degree(largest_subgraph_undirected)
+
+s1_degs <- degree(largest_subgraph_undirected, v = signal_s1)
+s1_ks <- ks.test(s1_degs, net_degs)
+cat("S1 (single BFS cluster): mean degree =", round(mean(s1_degs), 1),
+    ", KS p =", format.pval(s1_ks$p.value, digits = 3), "\n")
+
+s2_degs <- degree(largest_subgraph_undirected, v = signal_s2)
+s2_ks <- ks.test(s2_degs, net_degs)
+cat("S2 (dispersed clusters): mean degree =", round(mean(s2_degs), 1),
+    ", KS p =", format.pval(s2_ks$p.value, digits = 3), "\n")
+
+s7_degs <- degree(largest_subgraph_undirected, v = signal_s7)
+s7_ks <- ks.test(s7_degs, net_degs)
+cat("S7 (degree-matched cluster): mean degree =", round(mean(s7_degs), 1),
+    ", KS p =", format.pval(s7_ks$p.value, digits = 3), "\n")
+
+cat("S3 (dispersed hubs): mean degree =",
+    round(mean(degree(largest_subgraph_undirected, v = hubs_s3)), 1), "\n")
+
+s8_degs <- degree(largest_subgraph_undirected, v = signal_s8)
+s8_ks <- ks.test(s8_degs, net_degs)
+cat("S8 (degree-typical dispersed): mean degree =", round(mean(s8_degs), 1),
+    ", KS p =", format.pval(s8_ks$p.value, digits = 3), "\n")
+
+s3b_degs <- degree(largest_subgraph_undirected, v = signal_s3b)
+s3b_ks <- ks.test(s3b_degs, net_degs)
+cat("S3b (degree-typical null): mean degree =", round(mean(s3b_degs), 1),
+    ", KS p =", format.pval(s3b_ks$p.value, digits = 3), "\n")
+
+ks_diag <- tibble(
+  scenario     = c("S1: Single BFS", "S2: Dispersed", "S7: Degree-matched",
+                   "S3: Hubs", "S8: Degree-typical dispersed", "S3b: Degree-typical null"),
+  n_genes      = c(length(signal_s1), length(signal_s2), length(signal_s7),
+                   length(hubs_s3), length(signal_s8), length(signal_s3b)),
+  mean_degree  = c(mean(s1_degs), mean(s2_degs), mean(s7_degs),
+                   mean(degree(largest_subgraph_undirected, v = hubs_s3)),
+                   mean(s8_degs), mean(s3b_degs)),
+  network_mean = mean(net_degs),
+  ks_pvalue    = c(s1_ks$p.value, s2_ks$p.value, s7_ks$p.value,
+                   ks.test(degree(largest_subgraph_undirected, v = hubs_s3), net_degs)$p.value,
+                   s8_ks$p.value, s3b_ks$p.value)
+)
+
+ks_diag %>%
+  mutate(mean_degree = round(mean_degree, 1),
+         network_mean = round(network_mean, 1),
+         ks_pvalue = format.pval(ks_pvalue, digits = 3)) %>%
+  knitr::kable(caption = "KS test: signal gene degree vs network degree")
+```
+
+# S1: Single BFS cluster — AUC
+
+50 signal genes planted as one tight connected cluster via BFS.
+
+```{r}
+#| label: s1-auc-v2
+#| cache: true
+res_s1 <- run_synthetic_auc_parallel(
+  graph          = largest_subgraph_undirected,
+  signal_genes   = signal_s1,
+  n_total_vec    = n_total_vec,
+  reps_per_level = reps_per_level,
+  n_perm         = n_perm,
+  bin_cache      = bin_cache,
+  ics_bins_set   = ics_bins_set,
+  n_cores        = n_cores,
+  scenario_name  = "S1: Single cluster",
+  seed           = 100
+)
+```
+
+# S2: Dispersed clusters — AUC
+
+3 clusters of 20 genes each, BFS-planted with minimum 5-hop separation.
+
+```{r}
+#| label: s2-auc-v2
+#| cache: true
+res_s2 <- run_synthetic_auc_parallel(
+  graph          = largest_subgraph_undirected,
+  signal_genes   = signal_s2,
+  n_total_vec    = n_total_vec,
+  reps_per_level = reps_per_level,
+  n_perm         = n_perm,
+  bin_cache      = bin_cache,
+  ics_bins_set   = ics_bins_set,
+  n_cores        = n_cores,
+  scenario_name  = "S2: Dispersed clusters",
+  seed           = 200
+)
+```
+
+# S7: Degree-matched cluster — AUC
+
+50 signal genes in a BFS cluster whose degree distribution approximates the network background.
+
+```{r}
+#| label: s7-auc-v2
+#| cache: true
+res_s7 <- run_synthetic_auc_parallel(
+  graph          = largest_subgraph_undirected,
+  signal_genes   = signal_s7,
+  n_total_vec    = n_total_vec,
+  reps_per_level = reps_per_level,
+  n_perm         = n_perm,
+  bin_cache      = bin_cache,
+  ics_bins_set   = ics_bins_set,
+  n_cores        = n_cores,
+  scenario_name  = "S7: Degree-matched cluster",
+  seed           = 700
+)
+```
+
+# S8: Degree-typical dispersed — AUC
+
+GWAS-like signal: a few small BFS clusters plus isolated singletons, all degree-typical (KS p \> 0.05). Tests whether methods can detect mild, realistic clustering when degree is not confounded.
+
+```{r}
+#| label: s8-auc
+#| cache: true
+res_s8 <- run_synthetic_auc_parallel(
+  graph          = largest_subgraph_undirected,
+  signal_genes   = signal_s8,
+  n_total_vec    = n_total_vec,
+  reps_per_level = reps_per_level,
+  n_perm         = n_perm,
+  bin_cache      = bin_cache,
+  ics_bins_set   = ics_bins_set,
+  n_cores        = n_cores,
+  scenario_name  = "S8: Degree-typical dispersed",
+  seed           = 800
+)
+```
+
+# Combined AUC results
+
+```{r}
+#| label: combine-results
+all_res <- bind_rows(res_s1, res_s2, res_s7, res_s8)
+auc_tbl <- compute_auc_table(all_res)
+tpr_tbl <- compute_tpr_table(auc_tbl, fpr_target = 0.05)
+```
+
+## AUC and TPR summary
+
+```{r}
+#| label: auc-summary
+auc_tbl %>%
+  left_join(tpr_tbl %>% select(scenario, n_total, method, tpr_at_fpr),
+            by = c("scenario", "n_total", "method")) %>%
+  select(scenario, n_total, method, auc, tpr_at_fpr) %>%
+  arrange(scenario, n_total, desc(auc)) %>%
+  knitr::kable(digits = 3,
+               caption = "AUC and TPR@FPR=0.05 by scenario, sample size, and method")
+```
+
+## (a) AUC vs n_total, faceted by scenario
+
+```{r}
+#| label: plot-auc-vs-ntotal
+#| fig-width: 14
+#| fig-height: 6
+ggplot(auc_tbl, aes(x = factor(n_total), y = auc,
+                     color = method, group = method)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ scenario, nrow = 1) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50") +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title    = "Detection power: AUC by method and sample size",
+    subtitle = "Degree-matched nulls for all methods; dashed = random classifier",
+    x        = "n_total (signal + noise genes)",
+    y        = "AUC",
+    color    = "Method"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 9),
+        strip.text = element_text(face = "bold")) +
+  guides(color = guide_legend(ncol = 3))
+```
+
+## TPR at FPR = 0.05 vs n_total
+
+```{r}
+#| label: plot-tpr-vs-ntotal
+#| fig-width: 14
+#| fig-height: 6
+ggplot(tpr_tbl, aes(x = factor(n_total), y = tpr_at_fpr,
+                     color = method, group = method)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ scenario, nrow = 1) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "grey50") +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title    = "Detection power: TPR at FPR = 0.05",
+    subtitle = "How often each method detects real signal while controlling false positives",
+    x        = "n_total",
+    y        = "TPR @ FPR = 0.05",
+    color    = "Method"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 9),
+        strip.text = element_text(face = "bold")) +
+  guides(color = guide_legend(ncol = 3))
+```
+
+## (b) ROC curves at n_total = 200
+
+```{r}
+#| label: plot-roc-200
+#| fig-width: 14
+#| fig-height: 5
+roc_200 <- auc_tbl %>%
+  filter(n_total == 200) %>%
+  select(scenario, method, auc, roc) %>%
+  unnest(roc) %>%
+  mutate(label = paste0(method, " (", round(auc, 3), ")"))
+
+ggplot(roc_200, aes(x = FPR, y = TPR, color = label)) +
+  geom_line(linewidth = 0.9) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey60") +
+  facet_wrap(~ scenario, nrow = 1) +
+  coord_equal() +
+  labs(
+    title = "ROC curves at n_total = 200",
+    x     = "False Positive Rate",
+    y     = "True Positive Rate",
+    color = "Method (AUC)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 8),
+        strip.text = element_text(face = "bold")) +
+  guides(color = guide_legend(ncol = 3))
+```
+
+### ROC zoom: FPR 0–0.1
+
+```{r}
+#| label: plot-roc-zoom
+#| fig-width: 14
+#| fig-height: 5
+ggplot(roc_200, aes(x = FPR, y = TPR, color = label)) +
+  geom_line(linewidth = 0.9) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey60") +
+  geom_vline(xintercept = 0.05, linetype = "dotted", linewidth = 0.8) +
+  facet_wrap(~ scenario, nrow = 1) +
+  coord_cartesian(xlim = c(0, 0.1), ylim = c(0, 1)) +
+  labs(
+    title    = "ROC curves zoomed (n_total = 200, FPR 0-0.1)",
+    subtitle = "Dotted line = FPR = 0.05",
+    x        = "False Positive Rate",
+    y        = "True Positive Rate",
+    color    = "Method (AUC)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 8),
+        strip.text = element_text(face = "bold")) +
+  guides(color = guide_legend(ncol = 3))
+```
+
+# S3: Dispersed hubs — False positive rate
+
+S3 is a false positive control: high-degree dispersed genes with no topological clustering. We run 200 replicates and measure what fraction of p-values fall below 0.05 for each method × bins combination.
+
+```{r}
+#| label: s3-fpr-engine
+run_hub_fpr_parallel <- function(
+  graph,
+  hub_genes,
+  n_total,
+  n_reps       = 200,
+  n_perm       = 500,
+  bin_cache,
+  ics_bins_set = c(1, 4, 10),
+  seed         = 1,
+  n_cores      = 7
+) {
+  prep  <- prep_graph_fast(graph)
+  g     <- prep$g
+  A     <- prep$A
+  nodes <- prep$nodes
+
+  hub_genes  <- intersect(hub_genes, nodes)
+  background <- setdiff(nodes, hub_genes)
+  n_hub      <- min(length(hub_genes), n_total)
+  n_noise    <- n_total - n_hub
+
+  cl <- parallel::makeCluster(n_cores)
+  on.exit(parallel::stopCluster(cl), add = TRUE)
+  doParallel::registerDoParallel(cl)
+
+  parallel::clusterEvalQ(cl, {
+    suppressPackageStartupMessages({ library(igraph); library(Matrix) })
+    NULL
+  })
+
+  parallel::clusterExport(
+    cl,
+    varlist = c(
+      "g", "A", "nodes", "hub_genes", "background",
+      "n_total", "n_hub", "n_noise", "n_perm",
+      "ics_bins_set", "seed",
+      "fast_joincount", "global_moran_I", "ics_norm",
+      "sample_degree_matched", "bin_cache"
+    ),
+    envir = environment()
+  )
+
+  foreach(
+    rr = seq_len(n_reps),
+    .combine = dplyr::bind_rows,
+    .packages = c("igraph", "Matrix", "dplyr")
+  ) %dopar% {
+
+    set.seed(seed + rr)
+
+    # Hub-enriched gene set — not truly clustered, so rejection = false positive
+    target_nodes <- c(
+      sample(hub_genes, n_hub),
+      if (n_noise > 0) sample(background, n_noise) else character(0)
+    )
+
+    idx_target <- match(target_nodes, nodes)
+    x_obs <- integer(length(nodes)); x_obs[idx_target] <- 1L
+
+    # KS test: does this hub-enriched set's degree differ from network?
+    target_degs  <- degree(g, v = target_nodes)
+    network_degs <- degree(g)
+    ks_p <- ks.test(target_degs, network_degs)$p.value
+
+    obs_ics <- ics_norm(induced_subgraph(g, vids = target_nodes))
+    obs_gm  <- global_moran_I(A, x_obs)
+    obs_jc  <- fast_joincount(A, x_obs)
+
+    all_out <- list()
+
+    for (b in ics_bins_set) {
+      rand_ics <- numeric(n_perm)
+      rand_gm  <- numeric(n_perm)
+      rand_jc  <- numeric(n_perm)
+
+      for (p in seq_len(n_perm)) {
+        sset <- if (b > 1) {
+          sample_degree_matched(target_nodes, bin_cache,
+                                num_bins = b, replace = TRUE)
+        } else {
+          sample(nodes, n_total, replace = TRUE)
+        }
+        idx_s <- match(sset, nodes)
+        x_s   <- integer(length(nodes)); x_s[idx_s] <- 1L
+
+        rand_ics[p] <- ics_norm(induced_subgraph(g, vids = sset))
+        rand_gm[p]  <- global_moran_I(A, x_s)
+        rand_jc[p]  <- fast_joincount(A, x_s)
+      }
+
+      null_label <- if (b > 1) paste0("dm_bins=", b) else "uniform"
+
+      all_out[[length(all_out) + 1]] <- c(
+        setNames(mean(rand_ics <= obs_ics), paste0("ICS_bins=", b)),
+        setNames(mean(rand_gm >= obs_gm),   paste0("GlobalMoran_", null_label)),
+        setNames(mean(rand_jc >= obs_jc),   paste0("Joincount_", null_label))
+      )
+    }
+
+    out <- unlist(all_out)
+
+    data.frame(
+      rep      = rr,
+      method   = names(out),
+      p_value  = as.numeric(out),
+      ks_pvalue = ks_p,
+      stringsAsFactors = FALSE
+    )
+  }
+}
+```
+
+```{r}
+#| label: s3-run-v2
+#| cache: true
+fpr_s3_raw <- bind_rows(lapply(n_total_vec, function(nt) {
+  cat("S3 FPR, n_total =", nt, "\n")
+  res <- run_hub_fpr_parallel(
+    graph        = largest_subgraph_undirected,
+    hub_genes    = hubs_s3,
+    n_total      = nt,
+    n_reps       = 200,
+    n_perm       = n_perm,
+    bin_cache    = bin_cache,
+    ics_bins_set = ics_bins_set,
+    seed         = 300 + nt,
+    n_cores      = n_cores
+  )
+  res %>% mutate(n_total = nt)
+}))
+```
+
+## S3: False positive rate table
+
+A well-calibrated method under degree-matched null should have FPR near 0.05. Inflated FPR under uniform null (bins=1) is expected because hubs create apparent clustering via degree confound.
+
+```{r}
+#| label: s3-fpr-table
+fpr_table <- fpr_s3_raw %>%
+  group_by(n_total, method) %>%
+  summarise(
+    n_reps   = n(),
+    n_reject = sum(p_value <= 0.05),
+    fpr      = mean(p_value <= 0.05),
+    mean_p   = mean(p_value),
+    .groups  = "drop"
+  ) %>%
+  arrange(n_total, method)
+
+fpr_table %>%
+  select(n_total, method, fpr, mean_p) %>%
+  pivot_wider(names_from = n_total, values_from = c(fpr, mean_p),
+              names_glue = "{.value}_{n_total}") %>%
+  select(method, starts_with("fpr"), starts_with("mean_p")) %>%
+  knitr::kable(digits = 3,
+               caption = "S3 (dispersed hubs): False positive rate at alpha=0.05 (200 reps)")
+```
+
+```{r}
+#| label: plot-s3-fpr
+#| fig-width: 12
+#| fig-height: 6
+ggplot(fpr_table, aes(x = method, y = fpr, fill = factor(n_total))) +
+  geom_col(position = "dodge", width = 0.7) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "red", linewidth = 0.8) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1)) +
+  labs(
+    title    = "S3: False positive rate for hub genes (no real clustering)",
+    subtitle = "Red dashed = nominal alpha = 0.05. Bars above = degree confound not controlled.",
+    x        = "Method",
+    y        = "False positive rate",
+    fill     = "n_total"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  guides(fill = guide_legend(ncol = 3))
+```
+
+## S3: KS test diagnostic — does the test detect hub enrichment?
+
+The KS test compares each replicate's degree distribution against the full network. If hub enrichment creates a detectable degree shift, KS p \< 0.05 flags it. The hub fraction varies across n_total (50 hubs in 100 vs 50 in 500), so we break down by n_total.
+
+```{r}
+#| label: s3-ks-summary
+ks_df <- fpr_s3_raw %>%
+  distinct(n_total, rep, ks_pvalue)
+
+ks_summary <- ks_df %>%
+  group_by(n_total) %>%
+  summarise(
+    n_reps          = n(),
+    hub_frac        = round(min(length(hubs_s3), first(n_total)) / first(n_total), 2),
+    frac_ks_reject  = mean(ks_pvalue < 0.05),
+    mean_ks_p       = mean(ks_pvalue),
+    median_ks_p     = median(ks_pvalue),
+    min_ks_p        = min(ks_pvalue),
+    max_ks_p        = max(ks_pvalue),
+    .groups = "drop"
+  )
+
+ks_summary %>%
+  knitr::kable(digits = 4,
+               caption = "S3: KS test summary per n_total (degree of hub-enriched set vs network)")
+```
+
+```{r}
+#| label: plot-s3-ks-hist
+#| fig-width: 12
+#| fig-height: 4
+ggplot(ks_df, aes(x = ks_pvalue)) +
+  geom_histogram(bins = 20, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 0.05, linetype = "dashed", color = "red", linewidth = 0.8) +
+  facet_wrap(~ paste0("n_total = ", n_total, "\n(hub frac = ",
+                       round(pmin(length(hubs_s3), n_total) / n_total, 2), ")"),
+             nrow = 1, scales = "free_y") +
+  labs(
+    title    = "S3: KS p-value distribution (hub-enriched set degree vs network degree)",
+    subtitle = "Red dashed = 0.05. Mass at left = KS reliably detects hub enrichment.",
+    x        = "KS p-value",
+    y        = "Count"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+## S3: P-value distribution (calibration diagnostic)
+
+Well-calibrated methods should produce uniform p-value distributions under the null.
+
+```{r}
+#| label: plot-s3-pval-dist
+#| fig-width: 14
+#| fig-height: 10
+fpr_s3_raw %>%
+  filter(n_total == 200) %>%
+  ggplot(aes(x = p_value)) +
+  geom_histogram(bins = 20, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 0.05, linetype = "dashed", color = "red") +
+  facet_wrap(~ method, scales = "free_y", ncol = 3) +
+  labs(
+    title    = "S3: P-value distribution under hub-enriched null (n_total = 200)",
+    subtitle = "Well-calibrated methods show uniform distribution; pile-up at 0 = false positives",
+    x        = "p-value",
+    y        = "Count"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+# S3b: Degree-typical null — False positive rate
+
+S3b is a calibration control: degree-typical genes (KS p \> 0.05) with no topological clustering. A well-calibrated test should reject at approximately the nominal alpha = 0.05. FPR substantially below 0.05 would indicate the degree-matched null is over-conservative for degree-typical gene sets, suppressing true positives. FPR near 0.05 confirms proper calibration.
+
+```{r}
+#| label: s3b-fpr-run
+#| cache: true
+fpr_s3b_raw <- bind_rows(lapply(n_total_vec, function(nt) {
+  cat("S3b FPR, n_total =", nt, "\n")
+  res <- run_hub_fpr_parallel(
+    graph        = largest_subgraph_undirected,
+    hub_genes    = signal_s3b,
+    n_total      = nt,
+    n_reps       = 200,
+    n_perm       = n_perm,
+    bin_cache    = bin_cache,
+    ics_bins_set = ics_bins_set,
+    seed         = 3000,
+    n_cores      = n_cores
+  )
+  res %>% mutate(n_total = nt)
+}))
+```
+
+## S3b: False positive rate table
+
+Degree-typical genes should show well-calibrated FPR under ALL null models (both uniform and degree-matched), since there is no degree confound.
+
+```{r}
+#| label: s3b-fpr-table
+fpr_table_s3b <- fpr_s3b_raw %>%
+  group_by(n_total, method) %>%
+  summarise(
+    n_reps   = n(),
+    n_reject = sum(p_value <= 0.05),
+    fpr      = mean(p_value <= 0.05),
+    mean_p   = mean(p_value),
+    .groups  = "drop"
+  ) %>%
+  arrange(n_total, method)
+
+fpr_table_s3b %>%
+  select(n_total, method, fpr, mean_p) %>%
+  pivot_wider(names_from = n_total, values_from = c(fpr, mean_p),
+              names_glue = "{.value}_{n_total}") %>%
+  select(method, starts_with("fpr"), starts_with("mean_p")) %>%
+  knitr::kable(digits = 3,
+               caption = "S3b (degree-typical null): False positive rate at alpha=0.05 (200 reps)")
+```
+
+## S3 vs S3b: Side-by-side FPR comparison
+
+```{r}
+#| label: s3b-vs-s3-comparison
+comparison <- bind_rows(
+  fpr_table_s3b %>% mutate(scenario = "S3b: Degree-typical null"),
+  fpr_table %>% mutate(scenario = "S3: Dispersed hubs")
+) %>%
+  filter(grepl("bins=10|uniform|bins=1$", method)) %>%
+  select(scenario, n_total, method, fpr) %>%
+  pivot_wider(names_from = scenario, values_from = fpr)
+
+comparison %>%
+  knitr::kable(digits = 3,
+               caption = "FPR comparison: hubs vs degree-typical null (key methods)")
+```
+
+```{r}
+#| label: plot-s3b-fpr
+#| fig-width: 12
+#| fig-height: 6
+fpr_table_s3b %>%
+  filter(n_total == 200) %>%
+  mutate(
+    bins = as.integer(gsub(".*bins=(\\d+).*", "\\1", method)),
+    bins = ifelse(grepl("uniform|bins=1$", method), 1L, bins),
+    stat = case_when(
+      grepl("^GlobalMoran", method) ~ "Global Moran's I",
+      grepl("^ICS", method) ~ "ICS",
+      grepl("^Joincount", method) ~ "Join count"
+    )
+  ) %>%
+  filter(!is.na(stat)) %>%
+  ggplot(aes(x = factor(bins), y = fpr, fill = stat)) +
+  geom_col(position = "dodge") +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "red") +
+  labs(
+    title = "S3b calibration: FPR for degree-typical null (n = 200)",
+    subtitle = "Dashed red line = nominal alpha = 0.05",
+    x    = "Number of degree bins",
+    y    = "False positive rate",
+    fill = "Method"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## S3b: P-value distribution (calibration diagnostic)
+
+```{r}
+#| label: plot-s3b-pval-dist
+#| fig-width: 14
+#| fig-height: 10
+fpr_s3b_raw %>%
+  filter(n_total == 200) %>%
+  ggplot(aes(x = p_value)) +
+  geom_histogram(bins = 20, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = 0.05, linetype = "dashed", color = "red") +
+  facet_wrap(~ method, scales = "free_y", ncol = 3) +
+  labs(
+    title    = "S3b: P-value distribution under degree-typical null (n_total = 200)",
+    subtitle = "Well-calibrated methods show uniform distribution",
+    x        = "p-value",
+    y        = "Count"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+# Bin-stability summary
+
+For each detection scenario, plot AUC vs bins (1–10) for all methods at n_total = 200. This parallels the bin-stability curves from notebook 11 (GWAS CRC real data).
+
+```{r}
+#| label: bin-stability-extract
+# Extract the bins value from method names
+extract_bins <- function(method) {
+  # ICS_bins=4 -> 4; Moran_dm_bins=4 -> 4; Moran_uniform -> 1; etc.
+  ifelse(grepl("bins=", method),
+         as.integer(sub(".*bins=(\\d+).*", "\\1", method)),
+         1L)
+}
+
+extract_stat <- function(method) {
+  case_when(
+    grepl("^ICS",         method) ~ "ICS",
+    grepl("^GlobalMoran", method) ~ "Global Moran",
+    grepl("^Joincount",   method) ~ "Join Count",
+    TRUE ~ method
+  )
+}
+```
+
+## Detection scenarios: AUC vs bins
+
+```{r}
+#| label: bin-stability-auc
+#| fig-width: 14
+#| fig-height: 6
+bin_auc <- auc_tbl %>%
+  filter(n_total == 200) %>%
+  mutate(
+    bins = extract_bins(method),
+    stat = extract_stat(method)
+  )
+
+ggplot(bin_auc, aes(x = bins, y = auc, color = stat, group = stat)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ scenario, nrow = 1) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50") +
+  scale_x_continuous(breaks = 1:10) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title    = "Bin-stability: AUC vs number of degree bins (n_total = 200)",
+    subtitle = "Parallels bin-stability from notebook 11 (GWAS CRC real data)",
+    x        = "Number of degree bins",
+    y        = "AUC",
+    color    = "Method"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold"))
+```
+
+## Detection scenarios: TPR\@FPR=0.05 vs bins
+
+```{r}
+#| label: bin-stability-tpr
+#| fig-width: 14
+#| fig-height: 6
+bin_tpr <- tpr_tbl %>%
+  filter(n_total == 200) %>%
+  mutate(
+    bins = extract_bins(method),
+    stat = extract_stat(method)
+  )
+
+ggplot(bin_tpr, aes(x = bins, y = tpr_at_fpr, color = stat, group = stat)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ scenario, nrow = 1) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "grey50") +
+  scale_x_continuous(breaks = 1:10) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title = "Bin-stability: TPR@FPR=0.05 vs degree bins (n_total = 200)",
+    x     = "Number of degree bins",
+    y     = "TPR @ FPR = 0.05",
+    color = "Method"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold"))
+```
+
+## S3: FPR vs bins
+
+```{r}
+#| label: bin-stability-fpr
+#| fig-width: 14
+#| fig-height: 6
+bin_fpr <- fpr_table %>%
+  filter(n_total == 200) %>%
+  mutate(
+    bins = extract_bins(method),
+    stat = extract_stat(method)
+  )
+
+ggplot(bin_fpr, aes(x = bins, y = fpr, color = stat, group = stat)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "red") +
+  scale_x_continuous(breaks = 1:10) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title    = "S3 bin-stability: FPR vs degree bins (n_total = 200)",
+    subtitle = "Well-calibrated methods stay near 0.05 (red dashed) across all bin counts",
+    x        = "Number of degree bins",
+    y        = "False positive rate",
+    color    = "Method"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+# Save results
+
+```{r}
+#| label: save
+dir.create(here::here("results"), showWarnings = FALSE)
+
+saveRDS(all_res,      here::here("results", "synthetic_auc_raw.rds"))
+saveRDS(auc_tbl,      here::here("results", "synthetic_auc_table.rds"))
+saveRDS(tpr_tbl,      here::here("results", "synthetic_tpr_table.rds"))
+saveRDS(fpr_s3_raw,   here::here("results", "synthetic_s3_fpr_raw.rds"))
+saveRDS(fpr_table,    here::here("results", "synthetic_s3_fpr_summary.rds"))
+saveRDS(fpr_s3b_raw,  here::here("results", "synthetic_s3b_fpr_raw.rds"))
+saveRDS(fpr_table_s3b, here::here("results", "synthetic_s3b_fpr_summary.rds"))
+```
+
+# Summary
+
+```{r}
+#| label: summary
+cat("=== Detection scenarios: AUC summary ===\n\n")
+auc_tbl %>%
+  left_join(tpr_tbl %>% select(scenario, n_total, method, tpr_at_fpr),
+            by = c("scenario", "n_total", "method")) %>%
+  select(scenario, n_total, method, auc, tpr_at_fpr) %>%
+  group_by(scenario, method) %>%
+  summarise(
+    auc_100 = auc[n_total == 100],
+    auc_200 = auc[n_total == 200],
+    auc_500 = auc[n_total == 500],
+    tpr_200 = tpr_at_fpr[n_total == 200],
+    .groups = "drop"
+  ) %>%
+  arrange(scenario, desc(auc_200)) %>%
+  knitr::kable(digits = 3,
+               caption = "AUC across sample sizes and TPR@FPR=0.05 at n=200")
+
+cat("\n=== S3 false positive control (n_total=200) ===\n\n")
+fpr_table %>%
+  filter(n_total == 200) %>%
+  select(method, fpr, mean_p) %>%
+  arrange(method) %>%
+  knitr::kable(digits = 3,
+               caption = "S3 FPR at n=200 (expect ~0.05 for degree-matched, inflated for uniform)")
+```
+
+Key questions answered:
+
+1.  **Detection power (S1, S2, S7):** Which methods best distinguish real clustering from random, and how does power change with sample size?
+2.  **Multi-cluster advantage (S2 vs S1):** Does ICS's component-counting logic give it relative advantage when signal is dispersed across multiple modules?
+3.  **Degree confound (S7):** When signal genes have typical degree, do degree-controlled methods retain power while uncorrected methods lose it?
+4.  **False positive control (S3):** Which methods correctly identify hub-driven apparent clustering as spurious under each null model?

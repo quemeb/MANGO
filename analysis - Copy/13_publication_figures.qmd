@@ -1,0 +1,751 @@
+---
+title: "MANGO Publication Figures"
+format:
+  html:
+    embed-resources: true
+    toc: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(tidyverse)
+library(igraph)
+library(ggplot2)
+library(patchwork)
+library(here)
+library(scales)
+library(ggrepel)
+library(RColorBrewer)
+
+source(here("R", "stats.R"))
+source(here("R", "sampling.R"))
+source(here("R", "auc.R"))
+
+dir.create(here("figures"), showWarnings = FALSE)
+
+theme_set(
+  theme_classic(base_size = 12) +
+    theme(strip.background = element_blank())
+)
+
+# Consistent palette
+COL_MORAN <- "#2166AC"
+COL_JC    <- "#B2182B"
+COL_FRAG  <- "#808080"
+
+save_fig <- function(stem, plot, width = 8, height = 6) {
+  ggsave(here("figures", paste0(stem, ".png")), plot,
+         width = width, height = height, dpi = 300)
+  ggsave(here("figures", paste0(stem, ".pdf")), plot,
+         width = width, height = height)
+  invisible(plot)
+}
+```
+
+```{r load-shared}
+g         <- readRDS(here("networks", "largest_subgraph_undirected.rds"))
+bin_cache <- readRDS(here("networks", "degree_bin_cache.rds"))
+```
+
+---
+
+## Figure 1 — Method Schematic
+
+```{r fig1-placeholder}
+# Figure 1 will be produced in Inkscape / Illustrator.
+#
+# Two-panel layout:
+#   Panel A (Tier 1): gene set on network → degree-bin assignment →
+#                     permutation null → Moran's I distribution → p-value
+#   Panel B (Tier 2): induced subgraph → component jackknife →
+#                     gene-level jackknife
+#
+# Placeholder — no R output for this figure.
+message("Figure 1: schematic produced externally.")
+```
+
+---
+
+## Figure 2 — FPR Calibration Across Bin Count
+
+```{r fig2-data}
+# Confirmed columns: n_total, method, n_reps, n_reject, fpr, mean_p
+# Method naming: "GlobalMoran_dm_bins=<b>", "GlobalMoran_uniform",
+#                "ICS_bins=<b>",
+#                "Joincount_dm_bins=<b>", "Joincount_uniform"
+fpr_raw <- readRDS(here("results", "synthetic_s3_fpr_summary.rds"))
+
+fpr2 <- fpr_raw |>
+  filter(n_total == 200) |>
+  mutate(
+    stat = case_when(
+      grepl("^GlobalMoran", method) ~ "Moran's I",
+      grepl("^Joincount",   method) ~ "Join Count",
+      grepl("^ICS",         method) ~ "Fragmentation",
+      TRUE ~ method
+    ),
+    bins = case_when(
+      grepl("uniform", method) ~ 1L,
+      TRUE ~ as.integer(gsub(".*bins=(\\d+).*", "\\1", method))
+    )
+  ) |>
+  filter(!is.na(bins)) |>
+  arrange(stat, bins)
+
+# Verify
+cat("stat values:", paste(unique(fpr2$stat), collapse = ", "), "\n")
+cat("bins range:", range(fpr2$bins), "\n")
+```
+
+```{r fig2-plot}
+fig2 <- ggplot(fpr2, aes(x = bins, y = fpr, colour = stat, group = stat)) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", colour = "black",
+             linewidth = 0.5) +
+  annotate("text", x = 10.2, y = 0.05, label = "α = 0.05",
+           hjust = 0, vjust = -0.4, size = 3.2) +
+  geom_line(linewidth = 0.85) +
+  geom_point(size = 2.2) +
+  scale_x_continuous(breaks = 1:10, limits = c(1, 10.8)) +
+  scale_y_continuous(limits = c(0, 1.05), breaks = seq(0, 1, 0.1)) +
+  scale_colour_manual(
+    values = c("Moran's I" = COL_MORAN,
+               "Join Count" = COL_JC,
+               "Fragmentation" = COL_FRAG),
+    name = NULL
+  ) +
+  labs(x = "Number of degree-matching bins (B)",
+       y = "False positive rate at α = 0.05") +
+  theme(legend.position = c(0.82, 0.82),
+        legend.background = element_rect(fill = "white", colour = "grey80",
+                                         linewidth = 0.3))
+
+fig2
+save_fig("fig2_fpr_calibration", fig2, width = 6, height = 4.5)
+```
+
+---
+
+## Figure 3 — Degree Control Is Free (S7 Power Grid)
+
+```{r fig3-data}
+# Confirmed columns: K, signal_frac, method, auc
+# K: 100, 200, 500 | signal_frac: 0.05, 0.10, 0.20, 0.40
+# Methods present: GlobalMoran_dm_bins=10, GlobalMoran_uniform,
+#                  ICS_bins=1, ICS_bins=10, Joincount_dm_bins=10, Joincount_uniform
+deg_auc <- readRDS(here("results", "degree_typical_auc_table.rds"))
+
+cat("Columns:", paste(names(deg_auc), collapse = ", "), "\n")
+cat("K:", paste(sort(unique(deg_auc$K)), collapse = ", "), "\n")
+cat("signal_frac:", paste(sort(unique(deg_auc$signal_frac)), collapse = ", "), "\n")
+cat("methods:", paste(unique(deg_auc$method), collapse = ", "), "\n")
+
+# Panel A: AUC under 10-bin Moran's I
+p3a_data <- deg_auc |>
+  filter(method == "GlobalMoran_dm_bins=10") |>
+  mutate(
+    signal_pct = factor(paste0(signal_frac * 100, "%"),
+                        levels = paste0(sort(unique(signal_frac)) * 100, "%"))
+  )
+
+# Panel B: ΔAUC = uniform AUC − 10-bin AUC
+p3b_data <- deg_auc |>
+  filter(method %in% c("GlobalMoran_dm_bins=10", "GlobalMoran_uniform")) |>
+  pivot_wider(names_from = method, values_from = auc,
+              names_prefix = "auc_") |>
+  rename(auc_10bin  = `auc_GlobalMoran_dm_bins=10`,
+         auc_unif   = auc_GlobalMoran_uniform) |>
+  mutate(
+    delta_auc  = auc_unif - auc_10bin,
+    signal_pct = factor(paste0(signal_frac * 100, "%"),
+                        levels = paste0(sort(unique(signal_frac)) * 100, "%"))
+  )
+```
+
+```{r fig3-plot}
+p3a <- ggplot(p3a_data,
+              aes(x = factor(K), y = signal_pct, fill = auc)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(auc, 2)), size = 3.5, colour = "white") +
+  scale_fill_distiller(palette = "Blues", direction = 1,
+                       limits = c(0.5, 1.0), name = "AUC",
+                       oob = squish) +
+  labs(x = "Set size (K)", y = "Signal fraction",
+       title = "AUC (B = 10)") +
+  theme(panel.grid = element_blank(),
+        axis.line  = element_blank(),
+        axis.ticks = element_blank())
+
+p3b <- ggplot(p3b_data,
+              aes(x = factor(K), y = signal_pct, fill = delta_auc)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%.3f", delta_auc)), size = 3.5) +
+  scale_fill_distiller(palette = "RdBu", direction = 1,
+                       limits = c(-0.05, 0.05), name = "ΔAUC",
+                       oob = squish) +
+  labs(x = "Set size (K)", y = "Signal fraction",
+       title = "ΔAUC (uniform − B = 10)") +
+  theme(panel.grid = element_blank(),
+        axis.line  = element_blank(),
+        axis.ticks = element_blank())
+
+fig3 <- p3a + p3b +
+  plot_annotation(tag_levels = "A")
+
+fig3
+save_fig("fig3_power_grid", fig3, width = 10, height = 5)
+```
+
+---
+
+## Figure 4 — Single-Pathway Spiking
+
+```{r fig4-data}
+# Raw columns: pathway, pct_noise, label, rep, method, p_value, score, n_total
+# pct_noise in {0,20,40,60,80,100}; label 1=signal, 0=null; nulls at pct_noise=100
+sp_raw <- readRDS(here("results", "single_pathway_auc_raw.rds"))
+mp_auc <- readRDS(here("results", "multi_pathway_auc_table.rds"))
+pc     <- readRDS(here("pathway_info", "pathway_characterization.rds"))
+
+# pw_short lookup from aggregated table (has pathway -> pw_short mapping)
+sp_agg   <- readRDS(here("results", "single_pathway_auc_table.rds"))
+pw_short_lu <- sp_agg |>
+  distinct(pathway, pw_short) |>
+  filter(!is.na(pw_short))
+
+sp_deg <- pc |>
+  select(pathway, mean_full_deg) |>
+  rename(pathway_full = pathway)
+
+# Compute per-noise-level AUC:
+#   signal rows = label==1 at that pct_noise
+#   null rows   = label==0 at pct_noise==100 (same pathway / n_total / method)
+null_pool <- sp_raw |> filter(label == 0L, pct_noise == 100L)
+
+sp_auc_noise <- sp_raw |>
+  filter(label == 1L, pct_noise %in% c(0L, 20L, 40L, 60L, 80L)) |>
+  group_by(pathway, n_total, method, pct_noise) |>
+  group_modify(function(sig, key) {
+    nulls <- null_pool |>
+      filter(pathway == key$pathway,
+             n_total  == key$n_total,
+             method   == key$method)
+    combined <- bind_rows(sig, nulls)
+    if (sum(combined$label == 1L) < 1L || sum(combined$label == 0L) < 1L)
+      return(tibble(auc = NA_real_))
+    tibble(auc = roc_auc_from_p(combined, score_col = "score",
+                                label_col = "label")$auc)
+  }) |>
+  ungroup()
+
+cat("AUC rows:", nrow(sp_auc_noise), "\n")
+cat("pct_noise:", paste(sort(unique(sp_auc_noise$pct_noise)), collapse = ", "), "\n")
+cat("n_total:",   paste(sort(unique(sp_auc_noise$n_total)),   collapse = ", "), "\n")
+```
+
+```{r fig4-plot}
+# pct_noise 0→100% signal, 20→80%, 40→60%, 60→40%, 80→20%
+stratum_pal <- c("High degree" = "#2166AC",
+                 "Mid degree"  = "#74ADD1",
+                 "Low degree"  = "#ABD9E9")
+
+sp4 <- sp_auc_noise |>
+  filter(method == "GlobalMoran_dm_bins=10") |>
+  left_join(pw_short_lu, by = "pathway") |>
+  left_join(sp_deg, by = c("pathway" = "pathway_full")) |>
+  mutate(
+    degree_stratum = case_when(
+      mean_full_deg > 150 ~ "High degree",
+      mean_full_deg > 80  ~ "Mid degree",
+      TRUE                ~ "Low degree"
+    ),
+    degree_stratum = factor(degree_stratum,
+                            levels = c("High degree", "Mid degree", "Low degree")),
+    pw_label    = fct_reorder(coalesce(pw_short, pathway), mean_full_deg),
+    signal_frac = (100 - pct_noise) / 100,
+    K_label     = factor(paste0("K = ", n_total),
+                         levels = paste0("K = ", sort(unique(n_total))))
+  )
+
+# 6 pathways → 6 linetypes (perfect 1-to-1 with R's default linetype set)
+fig4 <- ggplot(sp4, aes(x = signal_frac, y = auc,
+                        colour   = degree_stratum,
+                        linetype = pw_label,
+                        shape    = pw_label,
+                        group    = pw_label)) +
+  geom_hline(yintercept = 0.80, linetype = "dashed", colour = "grey50",
+             linewidth = 0.45) +
+  geom_line(linewidth = 0.75, na.rm = TRUE) +
+  geom_point(size = 2.2, na.rm = TRUE) +
+  facet_wrap(~ K_label, ncol = 1) +
+  scale_x_continuous(
+    breaks = c(0.20, 0.40, 0.60, 0.80, 1.00),
+    labels = paste0(c(20, 40, 60, 80, 100), "%")
+  ) +
+  scale_y_continuous(limits = c(0.4, 1.0), breaks = seq(0.4, 1.0, 0.1)) +
+  scale_colour_manual(values = stratum_pal, name = "Degree stratum") +
+  scale_linetype_discrete(name = "Pathway") +
+  scale_shape_discrete(name   = "Pathway") +
+  labs(x = "Signal fraction", y = "AUC",
+       title = "Single-pathway spiking") +
+  guides(colour   = guide_legend(order = 1, ncol = 1),
+         linetype = guide_legend(order = 2, ncol = 1),
+         shape    = guide_legend(order = 2, ncol = 1)) +
+  theme(legend.position = "bottom",
+        legend.box      = "horizontal",
+        legend.margin   = margin(t = 4, b = 4),
+        strip.text      = element_text(size = 10))
+
+fig4
+save_fig("fig4_single_pathway_spiking", fig4, width = 10, height = 12)
+```
+
+---
+
+## Figure 5 — Multi-Pathway Spiking (K = 200)
+
+```{r fig5-mp-plot}
+# mp_auc columns: pw_set, K, signal_frac, method, auc, roc
+# K in {100, 200, 500}; signal_frac in {0.05, 0.10, 0.20, 0.40, 0.60}
+profile_pal <- c("High degree"       = "#2166AC",
+                 "Mid degree"        = "#74ADD1",
+                 "Low degree"        = "#ABD9E9",
+                 "Synthetic control" = "#808080")
+
+# Full pathway composition labels for legend
+set_full_labels <- c(
+  "Set 1" = "Set 1: TCR / Insulin / Cadherin",
+  "Set 2" = "Set 2: HRR / BCR / Clathrin",
+  "Set 3" = "Set 3: VEGFR2 / Ca2+ / FCERI",
+  "Set 4" = "Set 4: SCF-KIT / DAP12 / Phagocytosis",
+  "Set 5" = "Set 5: Chromatids / Rho / Inflammation",
+  "Set 6" = "Set 6: Olfactory / Neddylation / mTOR-AMPK",
+  "Set 7" = "Set 7: Synthetic degree-typical (neg. control)"
+)
+
+# Linetypes: reuse within-group (color already separates degree groups)
+set_lty <- c("Set 1" = "solid",   "Set 2" = "dashed",  "Set 3" = "dotted",
+             "Set 4" = "solid",   "Set 5" = "dashed",
+             "Set 6" = "solid",
+             "Set 7" = "longdash")
+
+set_shape <- c("Set 1" = 16, "Set 2" = 17, "Set 3" = 15,
+               "Set 4" = 16, "Set 5" = 17,
+               "Set 6" = 16,
+               "Set 7" = 4)
+
+mp5 <- mp_auc |>
+  filter(method == "GlobalMoran_dm_bins=10") |>
+  mutate(
+    degree_profile = case_when(
+      grepl("^Set [123]:", pw_set) ~ "High degree",
+      grepl("^Set [45]:",  pw_set) ~ "Mid degree",
+      grepl("^Set 6:",     pw_set) ~ "Low degree",
+      grepl("^Set 7:",     pw_set) ~ "Synthetic control",
+      TRUE ~ "Other"
+    ),
+    degree_profile = factor(degree_profile,
+                            levels = c("High degree", "Mid degree",
+                                       "Low degree", "Synthetic control")),
+    set_num   = as.integer(sub("^Set (\\d+):.*", "\\1", pw_set)),
+    set_label = factor(paste0("Set ", set_num),
+                       levels = paste0("Set ", 1:7)),
+    K_label   = factor(paste0("K = ", K),
+                       levels = paste0("K = ", sort(unique(K))))
+  )
+
+fig5 <- ggplot(mp5, aes(x = signal_frac, y = auc,
+                        colour   = degree_profile,
+                        linetype = set_label,
+                        shape    = set_label,
+                        group    = set_label)) +
+  geom_hline(yintercept = 0.80, linetype = "dashed", colour = "grey50",
+             linewidth = 0.45) +
+  geom_line(linewidth = 0.75, na.rm = TRUE) +
+  geom_point(size = 2.2, na.rm = TRUE) +
+  facet_wrap(~ K_label, ncol = 1) +
+  scale_x_continuous(
+    breaks = c(0.05, 0.10, 0.20, 0.40, 0.60),
+    labels = paste0(c(5, 10, 20, 40, 60), "%")
+  ) +
+  scale_y_continuous(limits = c(0.4, 1.0), breaks = seq(0.4, 1.0, 0.1)) +
+  scale_colour_manual(values = profile_pal, name = "Degree profile") +
+  scale_linetype_manual(values = set_lty,   labels = set_full_labels, name = "Set") +
+  scale_shape_manual(values   = set_shape,  labels = set_full_labels, name = "Set") +
+  labs(x = "Signal fraction", y = "AUC",
+       title = "Multi-pathway spiking") +
+  guides(colour   = guide_legend(order = 1, ncol = 1),
+         linetype = guide_legend(order = 2, ncol = 1),
+         shape    = guide_legend(order = 2, ncol = 1)) +
+  theme(legend.position = "bottom",
+        legend.box      = "horizontal",
+        legend.margin   = margin(t = 4, b = 4),
+        strip.text      = element_text(size = 10))
+
+fig5
+save_fig("fig5_multi_pathway_spiking", fig5, width = 10, height = 14)
+```
+
+---
+
+## Figure 6 — CRC GWAS Network Visualization
+
+```{r fig6-compute}
+#| cache: true
+#| cache-path: "_cache/fig6"
+
+gwas_raw    <- readRDS(here("data", "gwas_genes_crc.rds"))
+gwas_on_net <- intersect(gwas_raw, V(g)$name)
+cat("GWAS genes on network:", length(gwas_on_net), "\n")
+
+# Prep shared structures
+prep  <- prep_graph_fast(g)
+A     <- prep$A
+nodes <- prep$nodes
+
+idx_full <- match(gwas_on_net, nodes)
+x_full   <- integer(length(nodes)); x_full[idx_full] <- 1L
+I_full   <- global_moran_I(A, x_full)
+cat("I_full:", round(I_full, 5), "\n")
+
+# Induced subgraph
+gwas_subg  <- induced_subgraph(g, vids = gwas_on_net)
+comp       <- components(gwas_subg)
+art_pts    <- articulation_points(gwas_subg)
+art_names  <- V(gwas_subg)$name[art_pts]
+cat("Components:", comp$no, "| Largest:", max(comp$csize),
+    "| Art. points:", length(art_names), "\n")
+
+# Gene-level jackknife: ΔI_i = I_full - I_{-i}  (no permutations needed)
+gene_jack <- vapply(gwas_on_net, function(gene) {
+  reduced  <- setdiff(gwas_on_net, gene)
+  idx_r    <- match(reduced, nodes)
+  x_r      <- integer(length(nodes)); x_r[idx_r] <- 1L
+  I_full - global_moran_I(A, x_r)
+}, numeric(1))
+
+gene_jack_df <- tibble(
+  gene         = gwas_on_net,
+  delta_I      = gene_jack,
+  comp_id      = comp$membership[match(gwas_on_net, V(gwas_subg)$name)],
+  comp_size    = comp$csize[comp$membership[match(gwas_on_net, V(gwas_subg)$name)]],
+  is_art       = gwas_on_net %in% art_names,
+  subg_deg     = degree(gwas_subg, v = gwas_on_net)
+) |>
+  arrange(desc(delta_I))
+
+cat("Top 5 gene jackknife contributions:\n")
+print(head(gene_jack_df[, c("gene", "delta_I", "is_art", "comp_size")], 5))
+```
+
+```{r fig6-layout}
+# Non-singleton component IDs sorted largest → smallest
+non_sing_ids <- sort(unique(comp$membership[comp$csize[comp$membership] > 1]))
+comp_order   <- non_sing_ids[order(comp$csize[non_sing_ids], decreasing = TRUE)]
+# comp_order: [1]=24-gene dominant, [2]=8-gene, [3]=3-gene, [4]=2-gene
+
+large_comp  <- comp_order[1]
+sec_comp_ids <- comp_order[-1]
+
+# Named delta_I lookup (gene_jack is named by gwas_on_net from vapply)
+di_named <- setNames(gene_jack, gwas_on_net)
+
+# Scale pmax(delta_I, 0) to [smin, smax] within each component
+scale_node_size <- function(gene_names, di_vec, smin = 4, smax = 15) {
+  di  <- pmax(di_vec[gene_names], 0, na.rm = TRUE)
+  hi  <- max(di, na.rm = TRUE)
+  if (hi == 0) return(rep(smin, length(gene_names)))
+  smin + (di / hi) * (smax - smin)
+}
+
+# Dominant component subgraph + FR layout
+dom_genes <- V(gwas_subg)$name[comp$membership == large_comp]
+dom_subg  <- induced_subgraph(gwas_subg, vids = dom_genes)
+set.seed(42)
+lo_dom    <- layout_with_fr(dom_subg)
+dom_sizes <- scale_node_size(V(dom_subg)$name, di_named)
+dom_pch   <- ifelse(V(dom_subg)$name %in% art_names, 18L, 21L)
+
+# Secondary components
+sec_cols <- c("#D6604D", "#66BD63", "#F4A582")   # 8-gene, 3-gene, 2-gene
+sec_list <- lapply(seq_along(sec_comp_ids), function(i) {
+  cid   <- sec_comp_ids[i]
+  genes <- V(gwas_subg)$name[comp$membership == cid]
+  subg  <- induced_subgraph(gwas_subg, vids = genes)
+  lo    <- if (vcount(subg) == 2) {
+    matrix(c(-1, 0, 1, 0), nrow = 2)   # fixed layout for 2-node graphs
+  } else {
+    set.seed(42); layout_with_fr(subg)
+  }
+  list(subg  = subg,
+       lo    = lo,
+       sizes = scale_node_size(V(subg)$name, di_named),
+       pch   = ifelse(V(subg)$name %in% art_names, 18L, 21L),
+       col   = sec_cols[i],
+       n     = vcount(subg))
+})
+
+cat("Panel sizes — dominant:", vcount(dom_subg),
+    "| secondary:", paste(sapply(sec_list, `[[`, "n"), collapse = ", "),
+    "| singletons:", sum(comp$csize == 1), "\n")
+```
+
+```{r fig6-plot}
+#| fig-width: 12
+#| fig-height: 10
+
+.draw_comp <- function(subg, lo, sizes, pch_vec, fill_col,
+                       title_str, label_cex = 0.7,
+                       mar = c(0.5, 0.5, 1.8, 0.5)) {
+  par(mar = mar)
+  plot(subg,
+       layout             = lo,
+       vertex.shape       = "none",
+       vertex.label       = V(subg)$name,
+       vertex.label.cex   = label_cex,
+       vertex.label.color = "black",
+       vertex.label.dist  = 0.55,
+       edge.color         = "grey40",
+       edge.width         = 1.5,
+       edge.arrow.size    = 0,
+       main               = title_str)
+  points(lo[, 1], lo[, 2],
+         pch = pch_vec, bg = fill_col, col = fill_col,
+         cex = sizes / 4)
+}
+
+.plot_fig6 <- function() {
+  # Outer bottom margin for singleton annotation
+  par(oma = c(2, 0, 0, 0))
+
+  # layout(): dominant (panel 1) spans columns 1-2 of all 3 rows → ~67% width
+  layout(matrix(c(1, 1, 2,
+                  1, 1, 3,
+                  1, 1, 4), nrow = 3, byrow = TRUE))
+
+  # --- Panel 1: Dominant component (24 genes) ---
+  .draw_comp(
+    dom_subg, lo_dom, dom_sizes, dom_pch, "#2166AC",
+    title_str = paste0("Dominant component  (n = ", vcount(dom_subg), ")"),
+    label_cex = 0.7,
+    mar       = c(1, 1, 2.5, 1)
+  )
+
+  # Legend inside dominant panel
+  legend("bottomleft",
+         legend = c("Regular gene", "Articulation point",
+                    paste0("Dominant (n = ",         vcount(dom_subg),        ")"),
+                    paste0("Component 2 (n = ",      sec_list[[1]]$n,         ")"),
+                    paste0("Component 3 (n = ",      sec_list[[2]]$n,         ")"),
+                    paste0("Component 4 (n = ",      sec_list[[3]]$n,         ")")),
+         pch    = c(21, 18, 21, 21, 21, 21),
+         pt.bg  = c("grey50", "grey50",
+                    "#2166AC", sec_list[[1]]$col,
+                    sec_list[[2]]$col, sec_list[[3]]$col),
+         col    = c("grey50", "grey50",
+                    "#2166AC", sec_list[[1]]$col,
+                    sec_list[[2]]$col, sec_list[[3]]$col),
+         pt.cex = 1.4, bty = "n", cex = 0.72)
+
+  # --- Panels 2-4: Secondary components ---
+  sec_titles <- c(
+    paste0("8-gene component"),
+    paste0("3-gene component"),
+    paste0("2-gene component")
+  )
+  for (i in seq_along(sec_list)) {
+    sl <- sec_list[[i]]
+    .draw_comp(sl$subg, sl$lo, sl$sizes, sl$pch, sl$col,
+               title_str = sec_titles[i],
+               label_cex = 0.68)
+  }
+
+  # Singleton annotation in outer bottom margin
+  mtext(paste0("78 singleton genes not shown (no within-set edges)"),
+        side = 1, outer = TRUE, line = 0.6,
+        cex = 0.82, col = "grey40", adj = 0.5)
+}
+
+# Save PNG
+png(here("figures", "fig6_crc_network.png"),
+    width = 12, height = 10, units = "in", res = 300)
+.plot_fig6()
+invisible(dev.off())
+
+# Save PDF
+pdf(here("figures", "fig6_crc_network.pdf"), width = 12, height = 10)
+.plot_fig6()
+invisible(dev.off())
+
+# Display inline
+.plot_fig6()
+```
+
+---
+
+## Figure 7 — CRC Signal Attribution
+
+```{r fig7-comp-jackknife}
+#| cache: true
+#| cache-path: "_cache/fig7"
+
+# Re-establish graph prep (prep_graph_fast returns $g, $A, $nodes)
+prep  <- prep_graph_fast(g)
+A     <- prep$A
+nodes <- prep$nodes
+
+# Full-set p-value (10-bin degree-matched null, 1000 perms)
+set.seed(42)
+n_perm_fig6 <- 1000
+rand_full <- numeric(n_perm_fig6)
+for (i in seq_len(n_perm_fig6)) {
+  s      <- sample_degree_matched(gwas_on_net, bin_cache,
+                                   num_bins = 10, replace = TRUE)
+  idx_s  <- match(s, nodes)
+  x_s    <- integer(length(nodes)); x_s[idx_s] <- 1L
+  rand_full[i] <- global_moran_I(A, x_s)
+}
+p_full <- mean(rand_full >= I_full)
+cat("p_full:", p_full, "\n")
+
+# Component jackknife: remove each non-trivial component, recompute p
+non_trivial_comps <- sort(unique(comp$membership[comp$csize[comp$membership] > 1]))
+
+comp_jack_list <- lapply(non_trivial_comps, function(cid) {
+  comp_genes <- V(gwas_subg)$name[comp$membership == cid]
+  reduced    <- setdiff(gwas_on_net, comp_genes)
+
+  if (length(reduced) < 3) {
+    return(tibble(comp_id = cid, comp_size = length(comp_genes),
+                  p_minus_C = NA_real_))
+  }
+
+  idx_r  <- match(reduced, nodes)
+  x_obs  <- integer(length(nodes)); x_obs[idx_r] <- 1L
+  I_obs  <- global_moran_I(A, x_obs)
+
+  set.seed(42L + cid)
+  rand_c <- numeric(n_perm_fig6)
+  for (i in seq_len(n_perm_fig6)) {
+    s     <- sample_degree_matched(reduced, bin_cache,
+                                    num_bins = 10, replace = TRUE)
+    idx_s <- match(s, nodes)
+    x_s   <- integer(length(nodes)); x_s[idx_s] <- 1L
+    rand_c[i] <- global_moran_I(A, x_s)
+  }
+
+  tibble(comp_id   = cid,
+         comp_size = length(comp_genes),
+         p_minus_C = mean(rand_c >= I_obs))
+})
+
+comp_jack_df <- bind_rows(comp_jack_list) |>
+  mutate(
+    delta_p     = p_minus_C - p_full,
+    comp_label  = paste0("Comp ", comp_id, " (n=", comp_size, ")"),
+    is_dominant = comp_id == large_comp
+  ) |>
+  arrange(desc(comp_size))
+
+cat("Component jackknife results:\n")
+print(comp_jack_df[, c("comp_label", "p_minus_C", "delta_p", "is_dominant")])
+```
+
+```{r fig7-plot}
+# Significance-shift threshold: Δp where p_{-C} = 0.05
+thresh_delta <- 0.05 - p_full
+
+p6a <- ggplot(comp_jack_df |>
+                mutate(comp_label = fct_reorder(comp_label, comp_size)),
+              aes(x = comp_label, y = delta_p, fill = is_dominant)) +
+  geom_col(width = 0.7, colour = "grey30", linewidth = 0.3) +
+  geom_hline(yintercept = thresh_delta, linetype = "dashed",
+             colour = "red", linewidth = 0.6) +
+  geom_hline(yintercept = 0, colour = "grey40", linewidth = 0.4) +
+  annotate("text", x = 0.6, y = thresh_delta,
+           label = "p = 0.05 threshold", hjust = 0, vjust = -0.4,
+           size = 2.8, colour = "red") +
+  scale_fill_manual(values = c("TRUE" = "#2166AC", "FALSE" = "grey70"),
+                    guide = "none") +
+  coord_flip() +
+  labs(x = NULL,
+       y = expression(Delta*italic(p) == italic(p)[-C] - italic(p)[full]),
+       title = "Component jackknife") +
+  theme(axis.text.y = element_text(size = 8))
+
+# Panel B: gene jackknife for dominant component only
+dom_genes <- gene_jack_df |>
+  filter(comp_id == large_comp) |>
+  mutate(gene = fct_reorder(gene, delta_I))
+
+p6b <- ggplot(dom_genes,
+              aes(x = delta_I, y = gene, fill = is_art)) +
+  geom_col(width = 0.7, colour = "grey30", linewidth = 0.3) +
+  geom_vline(xintercept = 0, colour = "grey40", linewidth = 0.4) +
+  scale_fill_manual(values = c("TRUE" = "#2166AC", "FALSE" = "grey70"),
+                    labels = c("TRUE" = "Articulation point", "FALSE" = "Other gene"),
+                    name = NULL) +
+  labs(x = expression(Delta*italic(I)[i] == italic(I)[full] - italic(I)[-i]),
+       y = NULL,
+       title = paste0("Gene-level jackknife (dominant component, n = ",
+                      max(comp$csize), ")")) +
+  theme(legend.position = "bottom",
+        axis.text.y = element_text(size = 7.5))
+
+fig7 <- p6a + p6b +
+  plot_annotation(tag_levels = "A")
+
+fig7
+save_fig("fig7_crc_attribution", fig7, width = 11, height = 6)
+```
+
+---
+
+## Final Output Summary
+
+```{r summary}
+fig_files <- list.files(here("figures"),
+                        pattern = "\\.(png|pdf)$",
+                        full.names = TRUE)
+
+summary_df <- tibble(file = fig_files) |>
+  mutate(
+    name      = basename(file),
+    ext       = tools::file_ext(file),
+    size_kb   = round(file.size(file) / 1024, 1)
+  ) |>
+  filter(grepl("^fig[0-9]", name)) |>
+  arrange(name)
+
+if (nrow(summary_df) > 0) {
+  # Retrieve PNG dimensions
+  get_dims <- function(f) {
+    if (tools::file_ext(f) == "png") {
+      info <- tryCatch(
+        {
+          d <- png::readPNG(f, native = FALSE, info = TRUE)
+          attr(d, "info")[c("width", "height")]
+        },
+        error = function(e) list(width = NA, height = NA)
+      )
+      paste0(info$width, " × ", info$height, " px")
+    } else {
+      "—"
+    }
+  }
+
+  summary_df <- summary_df |>
+    mutate(dimensions = vapply(file, get_dims, character(1)))
+
+  cat("\nFigures saved to figures/:\n\n")
+  print(
+    summary_df |>
+      select(name, ext, size_kb, dimensions) |>
+      as.data.frame(),
+    row.names = FALSE
+  )
+} else {
+  cat("No figure files found in figures/\n")
+}
+```

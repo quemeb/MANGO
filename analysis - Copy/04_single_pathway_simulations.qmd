@@ -1,0 +1,148 @@
+---
+title: "Small Simulations"
+format: html
+editor: visual
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(igraph)
+  library(Matrix)
+  library(dplyr)
+  library(ggplot2)
+  library(here)
+})
+
+source(here::here("R/stats.R"))
+source(here::here("R/sampling.R"))
+source(here::here("R/simulation.R"))
+source(here::here("R/plotting.R"))
+```
+
+```{r}
+largest_subgraph_undirected <- readRDS(here::here("networks", "largest_subgraph_undirected.rds"))
+pathway_stats               <- readRDS(here::here("pathway_info", "pathway_stats.rds"))
+bin_cache                   <- readRDS(here::here("networks", "degree_bin_cache.rds"))
+```
+
+# Core statistics (ICS norm + Moran mean + Gi\* mean)
+
+Functions: `ics_norm()`, `fast_moran_mean()`, `fast_gistar_mean()`, `compute_stats_fast()` — sourced from `R/stats.R`
+
+# Degree-matched sampling via bin_cache (for ICS null only)
+
+This assumes your bin_cache\[\["bins_4"\]\]\$node_table has columns node and bin, and bin_members is a named list of bin→nodes.
+
+Function: `sample_degree_matched()` — sourced from `R/sampling.R`
+
+# Wrapper A: run one ICS bin setting across the noise sweep (numbers only)
+
+ICS null: degree-binned with num_bins_ics (or uniform if =1)
+
+Moran/Gi\* null: uniform node-set null (as you requested)
+
+returns a data.frame
+
+Function: `run_pathway_noise_sweep()` — sourced from `R/simulation.R`
+
+# Wrapper B: compare multiple ICS bin settings in one run (numbers only)
+
+Function: `run_pathway_noise_sweep_compare_ics_bins()` — sourced from `R/simulation.R`
+
+```{r}
+# Single run (ICS bins fixed to 4)
+res <- run_pathway_noise_sweep(
+  pathway_name = "Cadherin signaling pathway",
+  n_total = 100,
+  noise_steps = seq(0, 1, by = 0.2),
+  n_iterations = 1000,
+  num_bins_ics = 4,
+  graph = largest_subgraph_undirected,
+  pathway_data = pathway_stats,
+  bin_cache = bin_cache
+)
+
+res
+```
+
+```{r}
+# Compare ICS bins 1,2,4,6,10 (Moran/Gi* uniform)
+res_long <- run_pathway_noise_sweep_compare_ics_bins(
+  pathway_name = "Downstream TCR signaling",
+  n_total = 100,
+  noise_steps = seq(0, 1, by = 0.2),
+  n_iterations = 1000,
+  ics_bins_set = c(1, 2, 4, 6, 10),
+  graph = largest_subgraph_undirected,
+  pathway_data = pathway_stats,
+  bin_cache = bin_cache
+)
+
+res_long
+
+```
+
+```{r}
+plot_pvals_clean(res_long)
+plot_effect_by_bins(res_long)
+```
+
+```{r}
+res_long_reg <- run_pathway_noise_sweep_compare_ics_bins(
+  pathway_name = "Regulation of insulin secretion",
+  n_total = 100,
+  noise_steps = seq(0, 1, by = 0.2),
+  n_iterations = 1000,
+  ics_bins_set = c(1, 2, 4, 6, 10),
+  graph = largest_subgraph_undirected,
+  pathway_data = pathway_stats,
+  bin_cache = bin_cache
+)
+```
+
+```{r}
+plot_pvals_clean(res_long_reg)
+plot_effect_by_bins(res_long_reg)
+```
+
+```{r}
+fp <- false_positive_compare_ics_bins(
+  graph = largest_subgraph_undirected,
+  bin_cache = bin_cache,
+  n_total = 100,
+  ics_bins_set = c(1, 2, 4, 6, 10),
+  n_outer = 50,        # start smaller for a quick check
+  n_iterations = 500,   # then scale up later
+  alpha = 0.05,
+  seed = 1,
+  n_cores      = 7
+)
+
+fp
+
+```
+```{r}
+fp_full <- false_positive_compare_ics_bins(
+  graph        = largest_subgraph_undirected,
+  bin_cache    = bin_cache,
+  n_total      = 100,
+  ics_bins_set = c(1, 2, 4, 6, 10),
+  n_outer      = 5000,
+  n_iterations = 600,
+  alpha        = 0.05,
+  seed         = 1,
+  n_cores      = 7,
+  return_pvals = TRUE    # <-- this is what was missing
+)
+
+fp_full
+```
+```{r}
+fp_full$pvals %>%
+  mutate(fp_bins1 = bins_1 < 0.05,
+         fp_bins4 = bins_4 < 0.05) %>%
+  group_by(fp_bins1) %>%
+  summarise(mean_deg = mean(mean_degree),
+            median_deg = mean(median_degree))
+```
+

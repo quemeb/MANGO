@@ -1,0 +1,578 @@
+---
+title: "AUC Multiple Pathways (Mixture Signal)"
+format: html
+editor: visual
+---
+
+```{r}
+#| label: setup
+suppressPackageStartupMessages({
+  library(igraph)
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(purrr)
+  library(foreach)
+  library(doParallel)
+  library(here)
+})
+
+source(here::here("R/stats.R"))
+source(here::here("R/sampling.R"))
+source(here::here("R/auc.R"))
+source(here::here("R/simulation_synthetic.R"))
+source(here::here("R/plotting.R"))
+```
+
+```{r}
+#| label: load-data
+largest_subgraph_undirected <- readRDS(here::here("networks", "largest_subgraph_undirected.rds"))
+pathway_stats               <- readRDS(here::here("pathway_info", "pathway_stats.rds"))
+pw_char                     <- readRDS(here::here("pathway_info", "pathway_characterization.rds"))
+bin_cache                   <- readRDS(here::here("networks", "degree_bin_cache.rds"))
+```
+
+# Shared parameters
+
+```{r}
+#| label: params
+K_vec           <- c(100, 200, 500)
+signal_frac_vec <- c(0.05, 0.1, 0.2, 0.4, 0.6)
+reps            <- 100
+n_perm          <- 1000
+ics_bins_set    <- 1:10
+n_cores         <- 7
+```
+
+# Pathway set candidate exploration
+
+Group pathways by degree profile to build sets spanning high, mid, and low degree.
+
+```{r}
+#| label: candidates-high
+high_deg <- pw_char %>%
+  filter(mean_full_deg > 100, n_genes >= 30, n_components == 1) %>%
+  arrange(desc(n_genes))
+
+high_deg %>%
+  head(15) %>%
+  select(pathway, n_genes, mean_subgraph_deg, mean_full_deg) %>%
+  knitr::kable(digits = 1, caption = "High-degree candidates (mean_full_deg > 100)")
+```
+
+```{r}
+#| label: candidates-mid
+mid_deg <- pw_char %>%
+  filter(mean_full_deg >= 50, mean_full_deg <= 100, n_genes >= 30, n_components == 1) %>%
+  arrange(desc(n_genes))
+
+mid_deg %>%
+  head(15) %>%
+  select(pathway, n_genes, mean_subgraph_deg, mean_full_deg) %>%
+  knitr::kable(digits = 1, caption = "Mid-degree candidates (50-100)")
+```
+
+```{r}
+#| label: candidates-low
+low_deg <- pw_char %>%
+  filter(mean_full_deg < 50, n_genes >= 30, n_components == 1) %>%
+  arrange(desc(n_genes))
+
+low_deg %>%
+  head(15) %>%
+  select(pathway, n_genes, mean_subgraph_deg, mean_full_deg) %>%
+  knitr::kable(digits = 1, caption = "Low-degree candidates (mean_full_deg < 50)")
+```
+
+# Pathway set definitions
+
+Seven sets spanning high, mid, low degree profiles, plus a synthetic degree-typical pool.
+
+```{r}
+#| label: define-sets
+# --- High-degree sets (mean_full_deg > 100) ---
+set1_pathways <- c(
+  "Downstream TCR signaling",
+  "Regulation of insulin secretion",
+  "Cadherin signaling pathway"
+)
+set1_label <- "Set 1: TCR / Insulin / Cadherin"
+
+set2_pathways <- c(
+  "HDR through Homologous Recombination (HRR)",
+  "Antigen activates B Cell Receptor (BCR) leading to generation of second messengers",
+  "Clathrin-mediated endocytosis"
+)
+set2_label <- "Set 2: HRR / BCR / Clathrin"
+
+set3_pathways <- c(
+  "VEGFR2 mediated cell proliferation",
+  "Ca2+ pathway",
+  "FCERI mediated NF-kB activation"
+)
+set3_label <- "Set 3: VEGFR2 / Ca2+ / FCERI"
+
+set4_pathways <- c(
+  "Signaling by SCF-KIT",
+  "DAP12 signaling",
+  "Role of phospholipids in phagocytosis"
+)
+set4_label <- "Set 4: SCF-KIT / DAP12 / Phagocytosis"
+
+# --- Mid-degree set (mean_full_deg 50-100) ---
+set5_pathways <- c(
+  "Separation of Sister Chromatids",
+  "Rho GTPase cycle",
+  "Inflammation mediated by chemokine and cytokine signaling pathway"
+)
+set5_label <- "Set 5: Chromatids / Rho / Inflammation"
+
+# --- Low-degree set (mean_full_deg < 50) ---
+set6_pathways <- c(
+  "Olfactory Signaling Pathway",
+  "Neddylation",
+  "Energy dependent regulation of mTOR by LKB1-AMPK"
+)
+set6_label <- "Set 6: Olfactory / Neddylation / mTOR-AMPK"
+```
+
+## Set 7: Synthetic degree-typical pool
+
+500 random genes with degree distribution indistinguishable from the network (KS p \> 0.05). This serves as a degree-typical comparison against the pathway-based pools above.
+
+```{r}
+#| label: define-set7
+set.seed(777)
+set7_result <- select_degree_typical_dispersed(
+  largest_subgraph_undirected,
+  n_genes = 500, ks_alpha = 0.05, max_attempts = 500, seed = 777
+)
+set7_genes <- set7_result$genes
+cat("Set 7 synthetic pool:", length(set7_genes), "genes\n")
+cat("KS p =", round(set7_result$ks_pvalue, 4),
+    " | attempts:", set7_result$n_attempts, "\n")
+
+# Create a synthetic pathway entry for compatibility with run_fixed_mixture_auc_parallel
+set7_pathway_entry <- data.frame(
+  PATHWAY_NAMES = "SYNTHETIC_DEGREE_TYPICAL_500",
+  stringsAsFactors = FALSE
+)
+set7_pathway_entry$Genes <- list(set7_genes)
+
+# Augment pathway_stats with this synthetic entry
+pathway_stats_aug <- bind_rows(pathway_stats, set7_pathway_entry)
+
+set7_pathways <- "SYNTHETIC_DEGREE_TYPICAL_500"
+set7_label <- "Set 7: Synthetic degree-typical (500 genes)"
+```
+
+```{r}
+#| label: build-set-list
+net_nodes <- V(largest_subgraph_undirected)$name
+net_degs  <- degree(largest_subgraph_undirected)
+
+get_pool_genes <- function(pw_names) {
+  genes <- lapply(pw_names, function(pw) {
+    row <- pathway_stats_aug %>% filter(PATHWAY_NAMES == pw)
+    intersect(unique(unlist(row$Genes)), net_nodes)
+  })
+  unique(unlist(genes))
+}
+
+set_list <- list(
+  list(label = set1_label, pathways = set1_pathways),
+  list(label = set2_label, pathways = set2_pathways),
+  list(label = set3_label, pathways = set3_pathways),
+  list(label = set4_label, pathways = set4_pathways),
+  list(label = set5_label, pathways = set5_pathways),
+  list(label = set6_label, pathways = set6_pathways),
+  list(label = set7_label, pathways = set7_pathways)
+)
+
+# Verify all pathways exist and print pool sizes
+for (s in set_list) {
+  pool <- get_pool_genes(s$pathways)
+  cat(s$label, ": pool =", length(pool), "genes\n")
+  missing <- setdiff(s$pathways, pathway_stats_aug$PATHWAY_NAMES)
+  if (length(missing) > 0) cat("  WARNING missing:", paste(missing, collapse = ", "), "\n")
+}
+```
+
+# Degree diagnostic: pool genes vs network
+
+```{r}
+#| label: degree-diagnostic
+ks_diag <- bind_rows(lapply(set_list, function(s) {
+  pool <- get_pool_genes(s$pathways)
+  pool_degs <- degree(largest_subgraph_undirected, v = pool)
+  ks <- ks.test(pool_degs, net_degs)
+  tibble(
+    pathway_set      = s$label,
+    pool_size        = length(pool),
+    pool_mean_deg    = mean(pool_degs),
+    network_mean_deg = mean(net_degs),
+    pool_median_deg  = median(pool_degs),
+    network_median_deg = median(net_degs),
+    ks_statistic     = ks$statistic,
+    ks_pvalue        = ks$p.value
+  )
+}))
+
+ks_diag %>%
+  knitr::kable(digits = 4,
+               caption = "KS test: pool gene degree vs full network degree (all 7 sets)")
+```
+
+```{r}
+#| label: degree-density-plot
+#| fig-width: 16
+#| fig-height: 8
+density_df <- bind_rows(lapply(set_list, function(s) {
+  pool <- get_pool_genes(s$pathways)
+  pool_degs <- degree(largest_subgraph_undirected, v = pool)
+  bind_rows(
+    tibble(pathway_set = s$label, source = "Pool genes", degree = pool_degs),
+    tibble(pathway_set = s$label, source = "Full network", degree = net_degs)
+  )
+}))
+
+ggplot(density_df, aes(x = degree, fill = source, color = source)) +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  facet_wrap(~ pathway_set, nrow = 2, scales = "free_y") +
+  scale_x_log10() +
+  labs(
+    title = "Degree distribution: pathway pool genes vs full network",
+    x     = "Degree (log scale)",
+    y     = "Density",
+    fill  = NULL, color = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold"))
+```
+
+# Feasibility check
+
+A combination is feasible when `pool_size >= K * max(signal_frac_vec)`.
+
+```{r}
+#| label: feasibility
+feasibility <- bind_rows(lapply(set_list, function(s) {
+  pool_size <- length(get_pool_genes(s$pathways))
+  expand.grid(K = K_vec, stringsAsFactors = FALSE) %>%
+    mutate(
+      pathway_set       = s$label,
+      pool_size         = pool_size,
+      max_signal_needed = ceiling(K * max(signal_frac_vec)),
+      feasible          = pool_size >= max_signal_needed
+    )
+}))
+
+feasibility %>%
+  select(pathway_set, pool_size, K, max_signal_needed, feasible) %>%
+  arrange(pathway_set, K) %>%
+  knitr::kable(caption = paste0(
+    "Feasibility: pool_size >= K * max(signal_frac) = K * ",
+    max(signal_frac_vec)
+  ))
+
+cat("\nFeasible combinations:", sum(feasibility$feasible),
+    "/", nrow(feasibility), "\n")
+if (any(!feasibility$feasible)) {
+  cat("SKIPPING:\n")
+  feasibility %>%
+    filter(!feasible) %>%
+    mutate(msg = paste0("  ", pathway_set, " @ K=", K,
+                        " (pool=", pool_size, " < ", max_signal_needed, " needed)")) %>%
+    pull(msg) %>%
+    cat(sep = "\n")
+}
+```
+
+# Run all sets
+
+```{r}
+#| label: run-all-v2
+#| cache: true
+all_res <- bind_rows(lapply(set_list, function(s) {
+  feasible_K <- feasibility %>%
+    filter(pathway_set == s$label, feasible) %>%
+    pull(K)
+
+  if (length(feasible_K) == 0) {
+    cat("No feasible K for", s$label, "-- skipping.\n")
+    return(tibble())
+  }
+
+  cat("Running", s$label, "for K =", paste(feasible_K, collapse = ", "), "\n")
+  bind_rows(lapply(feasible_K, function(K) {
+    cat("  ", s$label, ", K =", K, "\n")
+    # Use augmented pathway data for Set 7's synthetic entry
+    pw_data <- if (any(s$pathways == "SYNTHETIC_DEGREE_TYPICAL_500")) pathway_stats_aug else pathway_stats
+    res <- run_fixed_mixture_auc_parallel(
+      graph           = largest_subgraph_undirected,
+      pathway_data    = pw_data,
+      bin_cache       = bin_cache,
+      fixed_pathways  = s$pathways,
+      K               = K,
+      signal_frac_vec = signal_frac_vec,
+      reps            = reps,
+      n_perm          = n_perm,
+      ics_bins_set    = ics_bins_set,
+      n_cores         = n_cores
+    )
+    res %>% mutate(K = K, pw_set = s$label)
+  }))
+}))
+
+if (nrow(all_res) == 0) {
+  stop("No feasible combinations ran.")
+}
+
+cat("Total results:", nrow(all_res), "rows\n")
+all_res %>% distinct(pw_set, K) %>% print()
+```
+
+# Compute AUC
+
+```{r}
+#| label: compute-auc
+auc_all <- all_res %>%
+  group_by(pw_set, K, signal_frac, method) %>%
+  group_modify(~ {
+    ra <- roc_auc_from_p(.x, score_col = "score", label_col = "label")
+    tibble(auc = ra$auc, roc = list(ra$roc))
+  }) %>%
+  ungroup()
+
+tpr_all <- auc_all %>%
+  transmute(
+    pw_set, K, signal_frac, method, auc,
+    tpr_at_fpr = map_dbl(roc, ~ max(.x$TPR[.x$FPR <= 0.05], na.rm = TRUE))
+  )
+```
+
+## Helpers
+
+```{r}
+#| label: bin-helpers
+extract_stat <- function(method) {
+  case_when(
+    grepl("^ICS",         method) ~ "ICS",
+    grepl("^GlobalMoran", method) ~ "Global Moran",
+    grepl("^Joincount",   method) ~ "Join Count",
+    TRUE ~ method
+  )
+}
+
+extract_bins <- function(method) {
+  ifelse(grepl("bins=", method),
+         as.integer(sub(".*bins=(\\d+).*", "\\1", method)),
+         1L)
+}
+```
+
+# AUC vs signal fraction (all sets, bins 1 and 10)
+
+```{r}
+#| label: plot-auc-all-sets
+#| fig-width: 16
+#| fig-height: 14
+auc_ref <- auc_all %>%
+  filter(extract_bins(method) %in% c(1, 10))
+
+ggplot(auc_ref, aes(x = signal_frac, y = auc, color = method, group = method)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.5) +
+  facet_grid(pw_set ~ paste0("K = ", K)) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50") +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_continuous(breaks = signal_frac_vec) +
+  labs(
+    title = "AUC vs signal fraction (bins=1 and bins=10, all sets)",
+    x     = "Signal fraction",
+    y     = "AUC",
+    color = "Method"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 7),
+        strip.text = element_text(face = "bold", size = 8)) +
+  guides(color = guide_legend(ncol = 3))
+```
+
+## TPR at FPR=0.05 (K = 200)
+
+```{r}
+#| label: plot-tpr-k200
+#| fig-width: 16
+#| fig-height: 10
+tpr_k200 <- tpr_all %>%
+  filter(K == 200, extract_bins(method) %in% c(1, 10))
+
+ggplot(tpr_k200, aes(x = signal_frac, y = tpr_at_fpr,
+                      color = method, group = method)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  facet_wrap(~ pw_set, nrow = 2) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "grey50") +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_continuous(breaks = signal_frac_vec) +
+  labs(
+    title = "TPR at FPR <= 0.05 (K = 200, bins=1 and bins=10)",
+    x     = "Signal fraction",
+    y     = "TPR @ FPR = 0.05",
+    color = "Method"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 7),
+        strip.text = element_text(face = "bold")) +
+  guides(color = guide_legend(ncol = 3))
+```
+
+## Bin-stability: AUC vs bins (K = 200, signal_frac = 0.2)
+
+```{r}
+#| label: bin-stability
+#| fig-width: 16
+#| fig-height: 10
+bin_stab <- auc_all %>%
+  filter(K == 200, signal_frac == 0.2) %>%
+  mutate(bins = extract_bins(method),
+         stat = extract_stat(method))
+
+ggplot(bin_stab, aes(x = bins, y = auc, color = stat, group = stat)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ pw_set, nrow = 2) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50") +
+  scale_x_continuous(breaks = 1:10) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title = "Bin-stability: AUC vs degree bins (K = 200, signal = 20%)",
+    x     = "Number of degree bins",
+    y     = "AUC",
+    color = "Method"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold"))
+```
+
+## AUC heatmap at K = 200, signal = 20%
+
+```{r}
+#| label: heatmap
+#| fig-width: 14
+#| fig-height: 8
+heat_df <- auc_all %>%
+  filter(K == 200, signal_frac == 0.2,
+         extract_bins(method) %in% c(1, 4, 10)) %>%
+  select(pw_set, method, auc)
+
+ggplot(heat_df, aes(x = method, y = pw_set, fill = auc)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(auc, 2)), size = 2.8) +
+  scale_fill_gradient2(low = "white", mid = "#B2D8D8", high = "#004D40",
+                       midpoint = 0.7, limits = c(0.4, 1)) +
+  labs(
+    title = "AUC heatmap: pathway set x method (K = 200, signal = 20%)",
+    x     = "Method",
+    y     = "Pathway set",
+    fill  = "AUC"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+```
+
+## Global Moran's I: cost of degree control (uniform vs bins=10)
+
+```{r}
+#| label: gmoran-cost
+gmoran_cost <- auc_all %>%
+  filter(method %in% c("GlobalMoran_uniform", "GlobalMoran_dm_bins=10")) %>%
+  select(pw_set, K, signal_frac, method, auc) %>%
+  pivot_wider(names_from = method, values_from = auc,
+              names_prefix = "auc_") %>%
+  rename(
+    uniform = `auc_GlobalMoran_uniform`,
+    bins10  = `auc_GlobalMoran_dm_bins=10`
+  ) %>%
+  mutate(delta = uniform - bins10)
+
+gmoran_cost %>%
+  knitr::kable(digits = 3,
+               caption = "Global Moran's I AUC: uniform vs bins=10 (delta = cost of degree control)")
+```
+
+## Join Count: cost of degree control (uniform vs bins=10)
+
+```{r}
+#| label: jc-cost
+jc_cost <- auc_all %>%
+  filter(method %in% c("Joincount_uniform", "Joincount_dm_bins=10")) %>%
+  select(pw_set, K, signal_frac, method, auc) %>%
+  pivot_wider(names_from = method, values_from = auc,
+              names_prefix = "auc_") %>%
+  rename(
+    uniform = `auc_Joincount_uniform`,
+    bins10  = `auc_Joincount_dm_bins=10`
+  ) %>%
+  mutate(delta = uniform - bins10)
+
+jc_cost %>%
+  knitr::kable(digits = 3,
+               caption = "Join Count AUC: uniform vs bins=10 (delta = cost of degree control)")
+```
+
+# Save results
+
+```{r}
+#| label: save
+dir.create(here::here("results"), showWarnings = FALSE)
+saveRDS(all_res, here::here("results", "multi_pathway_auc_raw.rds"))
+saveRDS(auc_all, here::here("results", "multi_pathway_auc_table.rds"))
+```
+
+# Summary
+
+```{r}
+#| label: ks-summary
+# KS summary across all 6 sets
+ks_diag %>%
+  select(pathway_set, pool_size, pool_mean_deg, network_mean_deg, ks_pvalue) %>%
+  mutate(hub_enriched = ifelse(ks_pvalue < 0.05, "Yes", "No")) %>%
+  knitr::kable(digits = 3,
+               caption = "KS summary: which sets are hub-enriched vs degree-typical?")
+```
+
+```{r}
+#| label: summary-top
+# Best methods at K = 200, signal = 20% for each pathway set
+auc_all %>%
+  filter(K == 200, signal_frac == 0.2) %>%
+  group_by(pw_set) %>%
+  slice_max(auc, n = 3) %>%
+  select(pw_set, method, auc) %>%
+  knitr::kable(digits = 3,
+               caption = "Top 3 methods per pathway set (K=200, signal=20%)")
+```
+
+```{r}
+#| label: summary-robustness
+# Robustness: mean AUC across all 6 sets at K=200, signal=20%
+auc_all %>%
+  filter(K == 200, signal_frac == 0.2) %>%
+  group_by(method) %>%
+  summarise(
+    mean_auc = mean(auc),
+    sd_auc   = sd(auc),
+    min_auc  = min(auc),
+    .groups  = "drop"
+  ) %>%
+  arrange(desc(mean_auc)) %>%
+  knitr::kable(digits = 3,
+               caption = "Method robustness: mean AUC across all 7 pathway sets (K=200, signal=20%)")
+```

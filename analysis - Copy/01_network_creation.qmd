@@ -1,0 +1,79 @@
+---
+title: "Reactome Panther KEGG Network"
+format: html
+editor: visual
+---
+
+```{r Libraries}
+library(paxtoolsr)
+library(igraph)
+library(stringr)
+library(ggplot2)
+library(tidyverse)
+library(ggraph)
+library(here)
+```
+
+```{r Files}
+ifile_1 <- here::here("data/raw", "PathwayCommons12.reactome.hgnc.txt")
+results_1 <- readSifnx(ifile_1)
+
+ifile_2 <- here::here("data/raw", "PathwayCommons12.panther.hgnc.txt")
+results_2 <- readSifnx(ifile_2)
+
+ifile_3 <- here::here("data/raw", "PathwayCommons12.kegg.hgnc.txt")
+results_3 <- readSifnx(ifile_3)
+```
+
+```{r Splitting Pathways}
+results_1$edges <- results_1$edges %>% 
+  separate_rows(PATHWAY_NAMES, sep = ";")
+
+# Separate stacked pathways for results_3
+results_2$edges <- results_2$edges %>% 
+  separate_rows(PATHWAY_NAMES, sep = ";")
+
+# Separate stacked pathways for results_4
+results_3$edges <- results_3$edges %>% 
+  separate_rows(PATHWAY_NAMES, sep = ";")
+```
+
+```{r interaction types}
+keep_types = c(
+  "controls-state-change-of",
+  "controls-transport-of",
+  "controls-phosphorylation-of",
+  "controls-expression-of"
+)
+
+combined_edges <- bind_rows(results_1$edges, results_2$edges)
+combined_edges <- bind_rows(combined_edges, results_3$edges)
+```
+
+```{r pathways}
+gene_pathway_list <- combined_edges %>% 
+  filter(INTERACTION_TYPE %in% keep_types)
+
+```
+
+```{r network creation}
+gene_pathway_unique <- gene_pathway_list[!duplicated(gene_pathway_list[, c("PARTICIPANT_A", "PARTICIPANT_B")]), ]
+edgelist_matrix <- as.matrix(gene_pathway_unique[, c("PARTICIPANT_A", "PARTICIPANT_B")])
+network_graph <- graph_from_edgelist(edgelist_matrix, directed = T)
+```
+
+```{r largest connected component}
+subgraphs <- igraph::groups(components(network_graph))
+lcc_index <- which.max(components(network_graph)$csize)
+lcc_nodes <- as.integer(which(components(network_graph)$membership == lcc_index))
+
+largest_subgraph <- induced_subgraph(network_graph,lcc_nodes)
+largest_subgraph_undirected <- as.undirected(largest_subgraph, mode = "collapse")
+```
+
+```{r saving graph and pathway info}
+saveRDS(gene_pathway_list, file = here::here("pathway_info", "gene_pathway_info.rds"), compress = "xz")
+write_csv(gene_pathway_list, file = here::here("pathway_info", "gene_pathway_info.csv.gz"))
+saveRDS(largest_subgraph, file = here::here("networks", "largest_subgraph_directed.rds"), compress = "xz")
+saveRDS(largest_subgraph_undirected, file = here::here("networks", "largest_subgraph_undirected.rds"), compress = "xz")
+```

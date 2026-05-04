@@ -1,0 +1,516 @@
+---
+title: "AUC Single Pathways (Multi-Pathway Comparison)"
+format: html
+editor: visual
+---
+
+```{r}
+#| label: setup
+suppressPackageStartupMessages({
+  library(igraph)
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(purrr)
+  library(foreach)
+  library(doParallel)
+  library(here)
+})
+
+source(here::here("R/stats.R"))
+source(here::here("R/sampling.R"))
+source(here::here("R/auc.R"))
+source(here::here("R/plotting.R"))
+```
+
+```{r}
+#| label: load-data
+largest_subgraph_undirected <- readRDS(here::here("networks", "largest_subgraph_undirected.rds"))
+pathway_stats               <- readRDS(here::here("pathway_info", "pathway_stats.rds"))
+pw_char                     <- readRDS(here::here("pathway_info", "pathway_characterization.rds"))
+bin_cache                   <- readRDS(here::here("networks", "degree_bin_cache.rds"))
+nodes                       <- V(largest_subgraph_undirected)$name
+```
+
+# Pathway candidate exploration
+
+Select pathways spanning different size and connectivity strata: at least 2 small (20--50 genes), 2 medium (80--200 genes), and 2 large (300+ genes), all with a single connected component.
+
+```{r}
+#| label: candidates-small
+small_candidates <- pw_char %>%
+  filter(n_genes >= 20, n_genes <= 50, n_components == 1) %>%
+  arrange(desc(mean_subgraph_deg)) %>%
+  head(10)
+
+small_candidates %>%
+  select(pathway, n_genes, mean_subgraph_deg, mean_full_deg) %>%
+  knitr::kable(digits = 1, caption = "Small pathway candidates (20-50 genes, 1 component)")
+```
+
+```{r}
+#| label: candidates-medium
+medium_candidates <- pw_char %>%
+  filter(n_genes >= 80, n_genes <= 200, n_components == 1) %>%
+  arrange(desc(mean_subgraph_deg)) %>%
+  head(10)
+
+medium_candidates %>%
+  select(pathway, n_genes, mean_subgraph_deg, mean_full_deg) %>%
+  knitr::kable(digits = 1, caption = "Medium pathway candidates (80-200 genes, 1 component)")
+```
+
+```{r}
+#| label: candidates-large
+large_candidates <- pw_char %>%
+  filter(n_genes >= 300, n_components == 1) %>%
+  arrange(desc(mean_subgraph_deg)) %>%
+  head(10)
+
+large_candidates %>%
+  select(pathway, n_genes, mean_subgraph_deg, mean_full_deg) %>%
+  knitr::kable(digits = 1, caption = "Large pathway candidates (300+ genes, 1 component)")
+```
+
+# Pathway selection
+
+Eight pathways chosen to span size strata and degree profiles.
+
+```{r}
+#| label: pathway-selection
+pathway_panel <- c(
+  "HDR through Homologous Recombination (HRR)",
+  "COPI-mediated anterograde transport",
+  "Clathrin-mediated endocytosis",
+  "Smooth Muscle Contraction",
+  "Olfactory Signaling Pathway",
+  "Downstream TCR signaling",
+  "Antigen activates B Cell Receptor (BCR) leading to generation of second messengers",
+  "FCERI mediated Ca+2 mobilization"
+)
+
+pathway_labels <- c(
+  "HDR through Homologous Recombination (HRR)" = "HRR",
+  "COPI-mediated anterograde transport"         = "COPI transport",
+  "Clathrin-mediated endocytosis"               = "Clathrin endocytosis",
+  "Smooth Muscle Contraction"                   = "Smooth Muscle",
+  "Olfactory Signaling Pathway"                 = "Olfactory",
+  "Downstream TCR signaling"                    = "TCR signaling",
+  "Antigen activates B Cell Receptor (BCR) leading to generation of second messengers"      = "BCR signaling",
+  "FCERI mediated Ca+2 mobilization"            = "FCERI Ca2+"
+)
+
+# Summary table with characterization stats
+pw_summary <- bind_rows(lapply(pathway_panel, function(pw) {
+  row <- pathway_stats %>% filter(PATHWAY_NAMES == pw)
+  pw_genes <- intersect(unique(unlist(row$Genes)), nodes)
+  char_row <- pw_char %>% filter(pathway == pw)
+  tibble(
+    short_name      = pathway_labels[pw],
+    n_genes         = length(pw_genes),
+    mean_subgraph_deg = char_row$mean_subgraph_deg,
+    mean_full_deg     = char_row$mean_full_deg,
+    size_stratum    = case_when(
+      length(pw_genes) <= 50  ~ "Small",
+      length(pw_genes) <= 200 ~ "Medium",
+      TRUE                    ~ "Large"
+    )
+  )
+}))
+
+pw_summary %>%
+  knitr::kable(digits = 1, caption = "Selected pathways: size and connectivity profile")
+```
+
+# Shared parameters
+
+```{r}
+#| label: params
+n_total_vec         <- c(100, 200, 500)
+signal_noise_levels <- c(0, 20, 40, 60, 80)
+reps_per_level      <- 100
+n_perm              <- 1000
+ics_bins_set        <- 1:10
+n_cores             <- 7
+```
+
+# KS degree diagnostic
+
+Before any heavy computation, test whether each pathway's genes have a different degree distribution from the full network.
+
+```{r}
+#| label: ks-diagnostic
+net_degs <- degree(largest_subgraph_undirected)
+
+ks_table <- bind_rows(lapply(pathway_panel, function(pw) {
+  row <- pathway_stats %>% filter(PATHWAY_NAMES == pw)
+  pw_genes <- intersect(unique(unlist(row$Genes)), nodes)
+  pw_degs <- degree(largest_subgraph_undirected, v = pw_genes)
+  ks <- ks.test(pw_degs, net_degs)
+  tibble(
+    pathway         = pathway_labels[pw],
+    n_genes         = length(pw_genes),
+    mean_degree     = round(mean(pw_degs), 1),
+    network_mean_degree = round(mean(net_degs), 1),
+    ks_statistic    = round(ks$statistic, 4),
+    ks_pvalue       = format.pval(ks$p.value, digits = 3)
+  )
+}))
+
+ks_table %>%
+  knitr::kable(caption = "KS test: pathway gene degree vs network degree")
+```
+
+```{r}
+#| label: ks-density-plot
+#| fig-width: 14
+#| fig-height: 8
+density_df <- bind_rows(lapply(pathway_panel, function(pw) {
+  row <- pathway_stats %>% filter(PATHWAY_NAMES == pw)
+  pw_genes <- intersect(unique(unlist(row$Genes)), nodes)
+  pw_degs <- degree(largest_subgraph_undirected, v = pw_genes)
+  bind_rows(
+    tibble(pathway = pathway_labels[pw], source = "Pathway genes", degree = pw_degs),
+    tibble(pathway = pathway_labels[pw], source = "Full network", degree = net_degs)
+  )
+}))
+
+ggplot(density_df, aes(x = degree, fill = source, color = source)) +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  facet_wrap(~ pathway, nrow = 2, scales = "free_y") +
+  scale_x_log10() +
+  labs(
+    title = "Degree distribution: pathway genes vs full network",
+    x     = "Degree (log scale)",
+    y     = "Density",
+    fill  = NULL, color = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold"))
+```
+
+# Feasibility check
+
+At the lowest noise level (`r min(signal_noise_levels)`%), we need `n_total * (1 - min_noise/100)` pathway genes. Check every pathway x n_total combination before running anything.
+
+```{r}
+#| label: feasibility
+max_signal_frac <- 1 - min(signal_noise_levels) / 100
+
+feasibility <- expand.grid(
+  pathway = pathway_panel,
+  n_total = n_total_vec,
+  stringsAsFactors = FALSE
+) %>%
+  rowwise() %>%
+  mutate(
+    pw_short          = pathway_labels[pathway],
+    n_genes           = length(intersect(
+      unique(unlist(pathway_stats$Genes[pathway_stats$PATHWAY_NAMES == pathway])),
+      nodes
+    )),
+    max_signal_needed = ceiling(n_total * max_signal_frac),
+    feasible          = n_genes >= max_signal_needed
+  ) %>%
+  ungroup()
+
+feasibility %>%
+  select(pw_short, n_genes, n_total, max_signal_needed, feasible) %>%
+  arrange(pw_short, n_total) %>%
+  knitr::kable(caption = paste0(
+    "Feasibility: pathway must have >= n_total * ",
+    max_signal_frac, " genes (noise levels: ",
+    paste(signal_noise_levels, collapse = ", "), "%)"
+  ))
+
+cat("\nFeasible combinations:", sum(feasibility$feasible),
+    "/", nrow(feasibility), "\n")
+if (any(!feasibility$feasible)) {
+  cat("SKIPPING:\n")
+  feasibility %>%
+    filter(!feasible) %>%
+    mutate(msg = paste0("  ", pw_short, " @ n_total=", n_total,
+                        " (", n_genes, " genes < ", max_signal_needed, " needed)")) %>%
+    pull(msg) %>%
+    cat(sep = "\n")
+}
+```
+
+# Run AUC across feasible pathway x n_total combinations
+
+```{r}
+#| label: run-all-v2
+#| cache: true
+feasible_combos <- feasibility %>% filter(feasible)
+
+all_res <- bind_rows(lapply(seq_len(nrow(feasible_combos)), function(i) {
+  pw <- feasible_combos$pathway[i]
+  nt <- feasible_combos$n_total[i]
+  cat(pathway_labels[pw], ", n_total =", nt, "\n")
+  res <- run_single_pathway_auc_parallel(
+    pathway_name        = pw,
+    graph               = largest_subgraph_undirected,
+    pathway_data        = pathway_stats,
+    bin_cache           = bin_cache,
+    n_total             = nt,
+    reps_per_level      = reps_per_level,
+    signal_noise_levels = signal_noise_levels,
+    null_noise_level    = 100,
+    n_perm              = n_perm,
+    ics_bins_set        = ics_bins_set,
+    n_cores             = n_cores
+  )
+  res %>%
+    mutate(score = -log10(pmax(p_value, 1e-300)),
+           n_total = nt)
+}))
+```
+
+# Compute AUC by pathway x n_total x method
+
+```{r}
+#| label: compute-auc
+auc_tbl <- all_res %>%
+  group_by(pathway, n_total, method) %>%
+  group_modify(~ {
+    ra <- roc_auc_from_p(.x, score_col = "score", label_col = "label")
+    tibble(auc = ra$auc, roc = list(ra$roc))
+  }) %>%
+  ungroup() %>%
+  mutate(pw_short = pathway_labels[pathway])
+
+tpr_tbl <- auc_tbl %>%
+  transmute(
+    pathway, pw_short, n_total, method, auc,
+    tpr_at_fpr = map_dbl(roc, ~ max(.x$TPR[.x$FPR <= 0.05], na.rm = TRUE))
+  )
+```
+
+## Pathway coverage by n_total
+
+```{r}
+#| label: coverage
+coverage <- all_res %>%
+  distinct(pathway, n_total) %>%
+  mutate(pw_short = pathway_labels[pathway])
+
+coverage %>%
+  mutate(present = TRUE) %>%
+  pivot_wider(id_cols = pw_short, names_from = n_total,
+              values_from = present, values_fill = FALSE,
+              names_prefix = "n_total=") %>%
+  knitr::kable(caption = "Pathway presence at each n_total (FALSE = skipped, infeasible)")
+```
+
+## AUC summary table
+
+```{r}
+#| label: auc-table
+auc_tbl %>%
+  select(pw_short, n_total, method, auc) %>%
+  arrange(pw_short, n_total, desc(auc)) %>%
+  knitr::kable(digits = 3,
+               caption = "AUC by pathway, sample size, and method")
+```
+
+## (a) AUC vs n_total, faceted by pathway
+
+```{r}
+#| label: plot-auc-by-pathway
+#| fig-width: 16
+#| fig-height: 10
+ggplot(auc_tbl, aes(x = factor(n_total), y = auc,
+                     color = method, group = method)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  facet_wrap(~ pw_short, nrow = 2) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50") +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title = "AUC vs sample size, faceted by pathway",
+    x     = "n_total",
+    y     = "AUC",
+    color = "Method"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 7),
+        strip.text = element_text(face = "bold")) +
+  guides(color = guide_legend(ncol = 5))
+```
+
+## (b) AUC vs n_total, faceted by method
+
+Which methods are most robust across pathways?
+
+```{r}
+#| label: extract-stat-helper
+extract_stat <- function(method) {
+  case_when(
+    grepl("^ICS",         method) ~ "ICS",
+    grepl("^GlobalMoran", method) ~ "Global Moran",
+    grepl("^Joincount",   method) ~ "Join Count",
+    TRUE ~ method
+  )
+}
+
+extract_bins <- function(method) {
+  ifelse(grepl("bins=", method),
+         as.integer(sub(".*bins=(\\d+).*", "\\1", method)),
+         1L)
+}
+```
+
+```{r}
+#| label: plot-auc-by-method
+#| fig-width: 16
+#| fig-height: 10
+auc_method <- auc_tbl %>%
+  mutate(stat = extract_stat(method),
+         bins = extract_bins(method)) %>%
+  filter(bins %in% c(1, 4, 10))
+
+ggplot(auc_method, aes(x = factor(n_total), y = auc,
+                        color = pw_short, group = pw_short)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  facet_wrap(~ method, ncol = 3) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50") +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title = "AUC vs sample size, faceted by method (bins 1, 4, 10)",
+    x     = "n_total",
+    y     = "AUC",
+    color = "Pathway"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 8),
+        strip.text = element_text(face = "bold", size = 9)) +
+  guides(color = guide_legend(ncol = 3))
+```
+
+## (c) AUC heatmap at n_total = 200
+
+```{r}
+#| label: heatmap-auc
+#| fig-width: 14
+#| fig-height: 7
+heat_df <- auc_tbl %>%
+  filter(n_total == 200) %>%
+  select(pw_short, method, auc)
+
+ggplot(heat_df, aes(x = method, y = pw_short, fill = auc)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(auc, 2)), size = 2.8) +
+  scale_fill_gradient2(low = "white", mid = "#B2D8D8", high = "#004D40",
+                       midpoint = 0.7, limits = c(0.4, 1)) +
+  labs(
+    title = "AUC heatmap: pathway x method (n_total = 200)",
+    x     = "Method",
+    y     = "Pathway",
+    fill  = "AUC"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        axis.text.y = element_text(size = 10))
+```
+
+## Bin-stability: AUC vs bins at n_total = 200
+
+```{r}
+#| label: bin-stability
+#| fig-width: 16
+#| fig-height: 10
+bin_stab <- auc_tbl %>%
+  filter(n_total == 200) %>%
+  mutate(bins = extract_bins(method),
+         stat = extract_stat(method))
+
+ggplot(bin_stab, aes(x = bins, y = auc, color = stat, group = stat)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ pw_short, nrow = 2) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50") +
+  scale_x_continuous(breaks = 1:10) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title = "Bin-stability: AUC vs degree bins (n_total = 200)",
+    x     = "Number of degree bins",
+    y     = "AUC",
+    color = "Method"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold"))
+```
+
+# ROC curves at n_total = 200 (bins 1, 4, 10)
+
+```{r}
+#| label: roc-200
+#| fig-width: 16
+#| fig-height: 10
+roc_200 <- auc_tbl %>%
+  filter(n_total == 200,
+         extract_bins(method) %in% c(1, 4, 10)) %>%
+  select(pw_short, method, auc, roc) %>%
+  unnest(roc) %>%
+  mutate(label = paste0(method, " (", round(auc, 3), ")"))
+
+ggplot(roc_200, aes(x = FPR, y = TPR, color = label)) +
+  geom_line(linewidth = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey60") +
+  facet_wrap(~ pw_short, nrow = 2) +
+  coord_equal() +
+  labs(
+    title = "ROC curves at n_total = 200 (bins 1, 4, 10)",
+    x     = "False Positive Rate",
+    y     = "True Positive Rate",
+    color = "Method (AUC)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 7),
+        strip.text = element_text(face = "bold")) +
+  guides(color = guide_legend(ncol = 3))
+```
+
+# Save results
+
+```{r}
+#| label: save
+dir.create(here::here("results"), showWarnings = FALSE)
+saveRDS(all_res, here::here("results", "single_pathway_auc_raw.rds"))
+saveRDS(auc_tbl, here::here("results", "single_pathway_auc_table.rds"))
+```
+
+# Summary
+
+```{r}
+#| label: summary
+# Best method per pathway at n_total = 200
+auc_tbl %>%
+  filter(n_total == 200) %>%
+  group_by(pw_short) %>%
+  slice_max(auc, n = 3) %>%
+  select(pw_short, method, auc) %>%
+  knitr::kable(digits = 3,
+               caption = "Top 3 methods per pathway (n_total = 200)")
+
+# Method robustness: mean AUC across pathways at n_total = 200
+auc_tbl %>%
+  filter(n_total == 200) %>%
+  group_by(method) %>%
+  summarise(
+    mean_auc = mean(auc),
+    sd_auc   = sd(auc),
+    min_auc  = min(auc),
+    .groups  = "drop"
+  ) %>%
+  arrange(desc(mean_auc)) %>%
+  knitr::kable(digits = 3,
+               caption = "Method robustness: mean AUC across 8 pathways (n_total = 200)")
+```

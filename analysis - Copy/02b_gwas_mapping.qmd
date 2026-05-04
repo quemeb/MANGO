@@ -1,0 +1,120 @@
+---
+title: "GWAS UniProt to Network Mapping"
+format: html
+editor: visual
+---
+
+Map CRC GWAS UniProt IDs directly to network PARTICIPANT node names via the UNIFICATION_XREF field in BioPAX node tables. Run once after `01_network_creation.qmd` and before any analysis.
+
+```{r}
+suppressPackageStartupMessages({
+  library(paxtoolsr)
+  library(igraph)
+  library(dplyr)
+  library(stringr)
+  library(tidyr)
+  library(here)
+})
+
+source(here::here("R/gwas_mapping.R"))
+```
+
+# Load network
+
+```{r}
+largest_subgraph_undirected <- readRDS(here::here("networks", "largest_subgraph_undirected.rds"))
+cat("Network nodes:", vcount(largest_subgraph_undirected), "\n")
+```
+
+# Load GWAS UniProt IDs
+
+```{r}
+# Replace this vector with your actual CRC GWAS UniProt IDs
+values <- c("P08922", "P39023", "Q92766", "Q13950", "P04271", "Q99700", "P32302",
+            "P12643", "P12644", "P22003", "P18075", "Q12874", "P05408", "Q92959",
+            "Q9Y2P5", "Q15059", "Q8NDV3", "P52823", "P51957", "O15119", "Q99593",
+            "Q9Y242", "Q9NQB0", "P61165", "Q99594", "O14746", "P19484", "P01137",
+            "Q9Y2G1", "P19075", "O95407", "Q9UNG2", "P48023", "P60174", "Q9Y210",
+            "O00294", "P62256", "Q16880", "P52735", "P56705", "P56706", "Q9H0A9",
+            "P58557", "P58505", "Q9P2N4", "Q9C0K0", "Q14112", "Q8IWY4", "P10643",
+            "Q9NZA1", "Q9HB63", "Q9BXS5", "Q6UXA7", "Q9NZ56", "Q96QV1", "Q9NPC7",
+            "Q8NHA4", "Q9H490", "P30279", "Q9Y6D5", "Q9NZ71", "Q9BQL6", "Q9Y366",
+            "O95613", "Q96NM4", "Q9BTV7", "Q96MK2", "Q9C037", "Q9Y614", "Q8NFV4",
+            "Q9ULJ6", "O95711", "P42025", "P21926", "Q96IQ7", "Q9BWV1", "P59510",
+            "Q14689", "Q96JA1", "Q7Z6B7", "P50851", "Q969Z0", "P12830", "P55291",
+            "P22223", "Q9HD26", "Q5JRX3", "Q9UEW8", "Q00526", "Q9NYF0", "Q96AJ9",
+            "P38936", "P42772", "Q16667", "Q9Y2I1", "Q6DKJ4", "Q15517", "P47902",
+            "Q9ULT6", "Q9Y603", "Q6UW10", "Q8TB24", "Q6P2D8", "O94900", "Q9Y3M8",
+            "Q86XS5", "Q7L775", "Q7Z5M8", "Q8IXK2", "Q5T6F0", "Q8IUC4", "O60565",
+            "Q9UHJ3", "Q7Z3G6", "O15551", "O75317", "Q86TU7", "Q70HW3", "Q15054",
+            "Q7Z6P3", "Q5T9G4", "Q9H6K1", "Q8TE67", "Q8TB92", "Q8N8Z6", "Q68CZ2",
+            "Q5XXA6", "Q9UPW6", "Q6MZN7", "P39059", "P08572", "Q8IVN3", "Q71F56",
+            "Q96LD8", "Q8WY41", "Q96A46", "P10915", "Q9BYD9", "Q9NQ94", "Q6WN34",
+            "Q8IVS8", "P09603", "P13611", "Q6ZSS3", "P32929", "Q7Z7H3", "P35222",
+            "Q3KR16", "Q5T7N2", "Q9H857", "Q6UWX4", "P05093", "Q6N021", "P35318",
+            "Q5TAA0", "Q6UUV7", "Q5FYB0", "Q96N87", "Q96MI6", "A6NI28", "Q6ZN01",
+            "Q2NL67", "A8K830", "O75925", "Q641Q3", "Q9H4E7", "E2RYF7", "Q5VUJ9",
+            "Q9BRU9", "Q6ZUT9", "Q9BPU9", "Q8N4M7", "Q86WS5", "Q6XUX3", "Q9NUA8",
+            "O14490", "Q9Y2G9", "Q969X5", "Q9C0D5", "Q99619", "Q86WB0", "Q9BVP2",
+            "Q86U86", "Q96AA3", "Q6UWQ5", "Q86TL2", "Q8IXP5", "Q6ZMI0", "P28562",
+            "Q92633", "P05305", "Q6ZNR0", "Q8TCU6", "O15372", "A6NCS4", "Q6QAJ8",
+            "Q6ZNM6", "A6NNL5", "P07332", "Q13643", "Q13451", "Q68DA7", "Q12952",
+            "O95954", "E2RYF6", "P19526", "P21217", "P51993", "Q03113", "Q5JWF2",
+            "A6NJY4", "P47775", "P28161", "Q01432", "Q9UJM8", "P01889", "P01909",
+            "P01911", "P17693", "P15428", "P55345", "P17936", "Q9Y4H2", "Q06033",
+            "Q14624", "P46977", "Q9Y5W3", "O43474", "Q13887", "O15230", "P11047",
+            "Q13753", "P29536", "Q07954", "P48449", "Q9Y586", "P84022", "O43541",
+            "O15105", "O15198", "P49641", "Q13163", "O60318", "P40692", "Q96Q89",
+            "P01106", "B2RTY4", "Q8TAU0", "P18846", "P29475", "Q99466", "Q92858",
+            "P01127", "P14618", "Q8N490", "Q06416", "O75626", "P48147", "Q13976",
+            "P35408", "P18031", "Q15256", "P06737", "Q15032", "O60216")
+
+values <- unique(values)
+
+cat("Input UniProt IDs:", length(values), "\n")
+```
+
+# Load PathwayCommons node tables
+
+```{r}
+#| include: false
+ifile_1 <- here::here("data/raw", "PathwayCommons12.reactome.hgnc.txt")
+results_1 <- readSifnx(ifile_1)
+
+ifile_2 <- here::here("data/raw", "PathwayCommons12.panther.hgnc.txt")
+results_2 <- readSifnx(ifile_2)
+
+ifile_3 <- here::here("data/raw", "PathwayCommons12.kegg.hgnc.txt")
+results_3 <- readSifnx(ifile_3)
+```
+
+# Build combined UniProt reference table
+
+```{r}
+uniprot_ref <- build_uniprot_ref(list(results_1$nodes, results_2$nodes, results_3$nodes))
+cat("UniProt reference entries:", nrow(uniprot_ref), "\n")
+cat("Unique PARTICIPANT names:", length(unique(uniprot_ref$PARTICIPANT)), "\n")
+cat("Unique UniProt IDs:", length(unique(uniprot_ref$Uniprot)), "\n")
+```
+
+# Map to network
+
+```{r}
+gwas_genes_crc <- map_uniprot_to_network(values, uniprot_ref, largest_subgraph_undirected)
+cat("GWAS genes on network:", length(gwas_genes_crc), "\n")
+```
+
+```{r}
+# Inspect unmapped IDs
+mapped_ids <- uniprot_ref %>% filter(Uniprot %in% values) %>% pull(Uniprot) %>% unique()
+unmapped <- setdiff(values, mapped_ids)
+cat("UniProt IDs not found in PathwayCommons:", length(unmapped), "\n")
+if (length(unmapped) > 0 && length(unmapped) <= 20) cat(unmapped, sep = ", ")
+```
+
+# Save
+
+```{r}
+saveRDS(gwas_genes_crc, file = here::here("data", "gwas_genes_crc.rds"))
+cat("Saved to data/gwas_genes_crc.rds\n")
+```
